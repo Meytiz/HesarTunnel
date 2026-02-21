@@ -87,12 +87,10 @@ detect_arch() {
 # Generate Random Secret Key
 # ─────────────────────────────────────────────────────────
 generate_secret_key() {
-    if command -v openssl &>/dev/null; then
+    if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex 16
-    elif [[ -r /dev/urandom ]]; then
-        cat /dev/urandom | tr -dc 'a-f0-9' | head -c 32
     else
-        cat /proc/sys/kernel/random/uuid | tr -d '-'
+        head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
     fi
 }
 
@@ -202,27 +200,32 @@ configure_tunnel() {
         log_error "Invalid port! Enter a number between 1-65535"
     done
 
-    # ─── Secret Key (auto-generate on Enter) ───
-    AUTO_KEY=$(generate_secret_key)
-    echo ""
-    echo -e "  ${YELLOW}Press Enter to auto-generate a secure key${NC}"
-    echo -e "  ${YELLOW}or type your own (min 16 chars):${NC}"
-    read -p "  Secret key [auto]: " SECRET_KEY
-
-    if [[ -z "$SECRET_KEY" ]]; then
-        SECRET_KEY="$AUTO_KEY"
+    # ─── Secret Key Management (Server vs Client) ───
+    if [[ "$MODE" == "server" ]]; then
+        # در سرور خارج: کلید به صورت خودکار ساخته شده و به کاربر نمایش داده می‌شود
+        SECRET_KEY=$(generate_secret_key)
         echo ""
-        echo -e "  ┌──────────────────────────────────────────┐"
-        echo -e "  │  ${GREEN}Auto-generated key:${NC}                      │"
-        echo -e "  │  ${BOLD}${YELLOW}${SECRET_KEY}${NC}  │"
-        echo -e "  │                                          │"
-        echo -e "  │  ${RED}⚠ Save this key! You need it on both${NC}     │"
-        echo -e "  │  ${RED}  server and client sides.${NC}                │"
-        echo -e "  └──────────────────────────────────────────┘"
+        echo -e "  ┌───────────────────────────────────────────────┐"
+        echo -e "  │  ${GREEN}Server Secret Key Generated:${NC}                 │"
+        echo -e "  │  ${BOLD}${YELLOW}${SECRET_KEY}${NC}       │"
+        echo -e "  │                                               │"
+        echo -e "  │  ${RED}⚠ COPY THIS KEY! You will need to enter it${NC}   │"
+        echo -e "  │  ${RED}  when configuring the Client (Iran) server.${NC} │"
+        echo -e "  └───────────────────────────────────────────────┘"
         echo ""
-    elif [[ ${#SECRET_KEY} -lt 16 ]]; then
-        log_error "Key must be at least 16 characters"
-        return
+        read -p "  Press Enter after you have saved this key..."
+    else
+        # در سرور ایران: کلید پرسیده می‌شود تا کاربر دستی وارد کند
+        echo ""
+        echo -e "  ${CYAN}[Client Configuration]${NC}"
+        echo -e "  ${YELLOW}Please paste the Secret Key generated on the Foreign Server:${NC}"
+        while true; do
+            read -p "  Server Secret Key: " SECRET_KEY
+            if [[ -n "$SECRET_KEY" && ${#SECRET_KEY} -ge 16 ]]; then
+                break
+            fi
+            log_error "Invalid! The secret key must be exactly the one from your server (min 16 chars)."
+        done
     fi
 
     # ─── Client-specific fields ───
