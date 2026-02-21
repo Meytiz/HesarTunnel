@@ -11,7 +11,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────
-APP_VERSION="1.1.0"
+APP_VERSION="1.2.0"
 REPO="Meytiz/HesarTunnel"
 BINARY_NAME="hesartunnel"
 INSTALL_DIR="/usr/local/bin"
