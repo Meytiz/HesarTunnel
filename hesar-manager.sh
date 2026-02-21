@@ -205,13 +205,13 @@ configure_tunnel() {
         # در سرور خارج: کلید به صورت خودکار ساخته شده و به کاربر نمایش داده می‌شود
         SECRET_KEY=$(generate_secret_key)
         echo ""
-        echo -e "  ┌───────────────────────────────────────────────┐"
-        echo -e "  │  ${GREEN}Server Secret Key Generated:${NC}                 │"
-        echo -e "  │  ${BOLD}${YELLOW}${SECRET_KEY}${NC}       │"
-        echo -e "  │                                               │"
-        echo -e "  │  ${RED}⚠ COPY THIS KEY! You will need to enter it${NC}   │"
+        echo -e "  ┌──────────────────────────────────────────────────────────┐"
+        echo -e "  │  ${GREEN}Server Secret Key Generated:${NC}               │"
+        echo -e "  │  ${BOLD}${YELLOW}${SECRET_KEY}${NC}                      │"
+        echo -e "  │                                                          │"
+        echo -e "  │  ${RED}⚠ COPY THIS KEY! You will need to enter it${NC}  │"
         echo -e "  │  ${RED}  when configuring the Client (Iran) server.${NC} │"
-        echo -e "  └───────────────────────────────────────────────┘"
+        echo -e "  └──────────────────────────────────────────────────────────┘"
         echo ""
         read -p "  Press Enter after you have saved this key..."
     else
