@@ -17,12 +17,11 @@ import (
 	"hesartunnel/pkg/pool"
 )
 
-// Client runs on the IRAN server.
-// It connects OUT to the foreign server (reverse tunnel)
-// and forwards incoming mux streams to local services.
 type Client struct {
-	cfg  *config.Config
-	pool *pool.BufferPool
+	cfg        *config.Config
+	pool       *pool.BufferPool
+	muxSession *mux.Mux
+	muxMu      sync.RWMutex
 }
 
 func New(cfg *config.Config) *Client {
@@ -33,8 +32,20 @@ func New(cfg *config.Config) *Client {
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	retryCount := 0
+	// اجرا کردن Listener لوکال (پورت ایران) فقط برای یک بار
+	localAddr := fmt.Sprintf(":%d", c.cfg.LocalPort)
+	listener, err := net.Listen("tcp", localAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on local port %d: %w", c.cfg.LocalPort, err)
+	}
+	defer listener.Close()
 
+	log.Printf("[INFO] Client reading on Local Port %s (Give this to users)", localAddr)
+
+	// اجرای حلقه پذیرش کاربران روی سرور ایران
+	go c.acceptUsers(listener)
+
+	retryCount := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -46,29 +57,54 @@ func (c *Client) Run(ctx context.Context) error {
 		if err != nil && ctx.Err() == nil {
 			retryCount++
 			delay := c.backoff(retryCount)
-			log.Printf("[WARN] Connection lost: %v (retry #%d in %v)",
-				err, retryCount, delay)
+			log.Printf("[WARN] Tunnel lost: %v (retry #%d in %v)", err, retryCount, delay)
 
 			if c.cfg.MaxReconnect > 0 && retryCount >= c.cfg.MaxReconnect {
-				return fmt.Errorf("max reconnect attempts reached (%d)", c.cfg.MaxReconnect)
+				return fmt.Errorf("max reconnect attempts reached")
 			}
-
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return nil
-			}
+			time.Sleep(delay)
 		} else if err == nil {
 			retryCount = 0
 		}
 	}
 }
 
+func (c *Client) acceptUsers(listener net.Listener) {
+	for {
+		userConn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+
+		go func(conn net.Conn) {
+			defer conn.Close()
+
+			c.muxMu.RLock()
+			m := c.muxSession
+			c.muxMu.RUnlock()
+
+			if m == nil {
+				log.Printf("[WARN] Tunnel is not ready, dropping user connection")
+				return
+			}
+
+			// باز کردن یک مسیر امن جدید برای کاربر در داخل تونل
+			stream, err := m.OpenStream()
+			if err != nil {
+				log.Printf("[WARN] Failed to open stream in tunnel: %v", err)
+				return
+			}
+			defer stream.Close()
+
+			c.biCopy(conn, stream)
+		}(userConn)
+	}
+}
+
 func (c *Client) connect(ctx context.Context) error {
 	serverAddr := fmt.Sprintf("%s:%d", c.cfg.ServerAddr, c.cfg.ServerPort)
-	log.Printf("[INFO] Connecting to %s...", serverAddr)
+	log.Printf("[INFO] Connecting tunnel to Foreign Server %s...", serverAddr)
 
-	// Dial with timeout
 	dialer := net.Dialer{Timeout: 10 * time.Second}
 	raw, err := dialer.DialContext(ctx, "tcp", serverAddr)
 	if err != nil {
@@ -76,12 +112,7 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	defer raw.Close()
 
-	// ─── PHASE 1: Raw TCP handshake (pre-obfuscation) ───
-
-	// Send fake TLS ClientHello on raw conn (defeats SNI-based DPI)
 	if c.cfg.Obfuscation == "tls" {
-		// Create a temporary ObfuscatedConn just for the ClientHello
-		// (uses fragmentedWrite internally to write to raw conn)
 		tmpObf := obfuscation.WrapConn(raw, obfuscation.Config{
 			PaddingRange:  c.cfg.PaddingRange,
 			FragmentRange: c.cfg.FragmentRange,
@@ -92,7 +123,6 @@ func (c *Client) connect(ctx context.Context) error {
 		}
 	}
 
-	// Generate and send session salt on raw conn
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return fmt.Errorf("salt: %w", err)
@@ -101,7 +131,6 @@ func (c *Client) connect(ctx context.Context) error {
 		return fmt.Errorf("send salt: %w", err)
 	}
 
-	// Derive session key from PSK + salt
 	key, err := crypto.DeriveKey(c.cfg.KeyHash[:], salt)
 	if err != nil {
 		return fmt.Errorf("key derive: %w", err)
@@ -112,15 +141,12 @@ func (c *Client) connect(ctx context.Context) error {
 		return fmt.Errorf("cipher: %w", err)
 	}
 
-	// ─── PHASE 2: Obfuscated connection (TLS record framing) ───
-
 	obfConn := obfuscation.WrapConn(raw, obfuscation.Config{
 		PaddingRange:  c.cfg.PaddingRange,
 		FragmentRange: c.cfg.FragmentRange,
 		SNI:           c.cfg.TLSSNI,
 	})
 
-	// Send encrypted auth + tunnel config through obfuscated conn
 	authData := make([]byte, 2)
 	binary.BigEndian.PutUint16(authData, uint16(c.cfg.RemotePort))
 
@@ -132,16 +158,22 @@ func (c *Client) connect(ctx context.Context) error {
 		return fmt.Errorf("send auth: %w", err)
 	}
 
-	log.Printf("[INFO] ✓ Authenticated with server")
-	log.Printf("[INFO] ✓ Tunnel: remote :%d -> local :%d",
-		c.cfg.RemotePort, c.cfg.LocalPort)
-
-	// ─── PHASE 3: Multiplexed tunnel session ───
+	log.Printf("[INFO] ✓ Tunnel Authenticated")
+	log.Printf("[INFO] ✓ Traffic Route: Users [:%d] ---> X-UI [:%d]", c.cfg.LocalPort, c.cfg.RemotePort)
 
 	muxSession := mux.NewMux(obfConn, cipher, false)
-	defer muxSession.Close()
+	
+	c.muxMu.Lock()
+	c.muxSession = muxSession
+	c.muxMu.Unlock()
 
-	// Heartbeat
+	defer func() {
+		c.muxMu.Lock()
+		c.muxSession = nil
+		c.muxMu.Unlock()
+		muxSession.Close()
+	}()
+
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
 
@@ -161,36 +193,13 @@ func (c *Client) connect(ctx context.Context) error {
 		}
 	}()
 
-	// Accept streams from server and forward to local service
+	// بلاک ماندن کلاینت تا زمانی که ارتباط تونل قطع شود
 	for {
-		select {
-		case <-connCtx.Done():
-			return nil
-		default:
-		}
-
-		stream, err := muxSession.AcceptStream()
+		_, err := muxSession.AcceptStream()
 		if err != nil {
-			return fmt.Errorf("accept stream: %w", err)
+			return fmt.Errorf("tunnel closed: %w", err)
 		}
-		go c.handleStream(stream)
 	}
-}
-
-func (c *Client) handleStream(stream *mux.Stream) {
-	defer stream.Close()
-
-	// Connect to local service
-	localAddr := fmt.Sprintf("127.0.0.1:%d", c.cfg.LocalPort)
-	localConn, err := net.DialTimeout("tcp", localAddr, 5*time.Second)
-	if err != nil {
-		log.Printf("[WARN] Local connect %s failed: %v", localAddr, err)
-		return
-	}
-	defer localConn.Close()
-
-	// Bidirectional copy
-	c.biCopy(localConn, stream)
 }
 
 func (c *Client) biCopy(a, b io.ReadWriteCloser) {
@@ -213,7 +222,7 @@ func (c *Client) backoff(retry int) time.Duration {
 	base := time.Duration(c.cfg.ReconnectSec) * time.Second
 	shift := retry
 	if shift > 6 {
-		shift = 6 // cap at 64x base
+		shift = 6
 	}
 	delay := base * time.Duration(1<<shift)
 	if delay > 2*time.Minute {
