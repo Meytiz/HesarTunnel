@@ -50,7 +50,7 @@ func (c *Client) Run(ctx context.Context) error {
 				err, retryCount, delay)
 
 			if c.cfg.MaxReconnect > 0 && retryCount >= c.cfg.MaxReconnect {
-				return fmt.Errorf("max reconnect attempts reached")
+				return fmt.Errorf("max reconnect attempts reached (%d)", c.cfg.MaxReconnect)
 			}
 
 			select {
@@ -58,7 +58,7 @@ func (c *Client) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			}
-		} else {
+		} else if err == nil {
 			retryCount = 0
 		}
 	}
@@ -76,26 +76,28 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	defer raw.Close()
 
-	// Wrap with obfuscation (anti-DPI)
-	obfConn := obfuscation.WrapConn(raw, obfuscation.Config{
-		PaddingRange:  c.cfg.PaddingRange,
-		FragmentRange: c.cfg.FragmentRange,
-		SNI:           c.cfg.TLSSNI,
-	})
+	// ─── PHASE 1: Raw TCP handshake (pre-obfuscation) ───
 
-	// Send fake TLS ClientHello (defeats SNI-based DPI)
+	// Send fake TLS ClientHello on raw conn (defeats SNI-based DPI)
 	if c.cfg.Obfuscation == "tls" {
-		if err := obfConn.FakeClientHello(); err != nil {
+		// Create a temporary ObfuscatedConn just for the ClientHello
+		// (uses fragmentedWrite internally to write to raw conn)
+		tmpObf := obfuscation.WrapConn(raw, obfuscation.Config{
+			PaddingRange:  c.cfg.PaddingRange,
+			FragmentRange: c.cfg.FragmentRange,
+			SNI:           c.cfg.TLSSNI,
+		})
+		if err := tmpObf.FakeClientHello(); err != nil {
 			return fmt.Errorf("fake hello: %w", err)
 		}
 	}
 
-	// Generate session salt and send it
+	// Generate and send session salt on raw conn
 	salt, err := crypto.GenerateSalt()
 	if err != nil {
 		return fmt.Errorf("salt: %w", err)
 	}
-	if _, err := obfConn.Conn.Write(salt); err != nil {
+	if _, err := raw.Write(salt); err != nil {
 		return fmt.Errorf("send salt: %w", err)
 	}
 
@@ -110,7 +112,15 @@ func (c *Client) connect(ctx context.Context) error {
 		return fmt.Errorf("cipher: %w", err)
 	}
 
-	// Send encrypted auth + tunnel config
+	// ─── PHASE 2: Obfuscated connection (TLS record framing) ───
+
+	obfConn := obfuscation.WrapConn(raw, obfuscation.Config{
+		PaddingRange:  c.cfg.PaddingRange,
+		FragmentRange: c.cfg.FragmentRange,
+		SNI:           c.cfg.TLSSNI,
+	})
+
+	// Send encrypted auth + tunnel config through obfuscated conn
 	authData := make([]byte, 2)
 	binary.BigEndian.PutUint16(authData, uint16(c.cfg.RemotePort))
 
@@ -126,7 +136,8 @@ func (c *Client) connect(ctx context.Context) error {
 	log.Printf("[INFO] ✓ Tunnel: remote :%d -> local :%d",
 		c.cfg.RemotePort, c.cfg.LocalPort)
 
-	// Create multiplexed session
+	// ─── PHASE 3: Multiplexed tunnel session ───
+
 	muxSession := mux.NewMux(obfConn, cipher, false)
 	defer muxSession.Close()
 
@@ -150,17 +161,23 @@ func (c *Client) connect(ctx context.Context) error {
 		}
 	}()
 
-	// Accept streams and forward to local service
+	// Accept streams from server and forward to local service
 	for {
+		select {
+		case <-connCtx.Done():
+			return nil
+		default:
+		}
+
 		stream, err := muxSession.AcceptStream()
 		if err != nil {
 			return fmt.Errorf("accept stream: %w", err)
 		}
-		go c.handleStream(connCtx, stream)
+		go c.handleStream(stream)
 	}
 }
 
-func (c *Client) handleStream(ctx context.Context, stream *mux.Stream) {
+func (c *Client) handleStream(stream *mux.Stream) {
 	defer stream.Close()
 
 	// Connect to local service
@@ -180,30 +197,27 @@ func (c *Client) biCopy(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	copy := func(dst io.Writer, src io.Reader) {
+	copyFn := func(dst io.Writer, src io.Reader) {
 		defer wg.Done()
 		buf := c.pool.Get()
 		defer c.pool.Put(buf)
 		io.CopyBuffer(dst, src, buf)
 	}
 
-	go copy(a, b)
-	go copy(b, a)
+	go copyFn(a, b)
+	go copyFn(b, a)
 	wg.Wait()
 }
 
 func (c *Client) backoff(retry int) time.Duration {
 	base := time.Duration(c.cfg.ReconnectSec) * time.Second
-	delay := base * time.Duration(1<<min(retry, 6)) // exponential, max 64x
+	shift := retry
+	if shift > 6 {
+		shift = 6 // cap at 64x base
+	}
+	delay := base * time.Duration(1<<shift)
 	if delay > 2*time.Minute {
 		delay = 2 * time.Minute
 	}
 	return delay
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
