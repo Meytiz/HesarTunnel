@@ -58,7 +58,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesa
 
 ## 🏗️ Architecture
 
-\`\`\`
+```
 ┌─────────────────┐         ┌──────────────────────┐           ┌───────────────┐
 │   Users/Clients │ ──TCP──▶│   Foreign Server     │ ◀──────  │ Iran Server   │
 │   (Internet)    │         │   (HesarTunnel SRV)  │ Reverse  │ (HesarTunnel  │
@@ -73,7 +73,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesa
                             │ Random Padding        │
                             │ TCP Fragmentation     │
                             └───────────────────────┘
-\`\`\`
+```
 
 ---
 
