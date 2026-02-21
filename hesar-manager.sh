@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # HesarTunnel Manager - Quick Install & Management Script
-# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/HesarTunnel/main/hesar-manager.sh)
+# Usage: bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesar-manager.sh)
 #
 # Supports: Ubuntu 20+, Debian 11+, CentOS 8+, AlmaLinux 8+
 #
@@ -12,7 +12,7 @@ set -euo pipefail
 # Constants
 # ─────────────────────────────────────────────────────────
 VERSION="1.2.0"
-REPO="YOUR_USER/HesarTunnel"
+REPO="Meytiz/HesarTunnel"
 BINARY_NAME="hesartunnel"
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/hesartunnel"
