@@ -1,0 +1,38 @@
+# HesarTunnel Configuration
+# Copy this file and adjust for your setup.
+
+# Mode: "server" (foreign VPS) or "client" (Iran server)
+mode = "client"
+
+# Foreign server address (client mode only)
+server_addr = "your-foreign-server.com"
+server_port = 4443
+
+# Port mapping (client mode)
+local_port = 8080       # Local service port (Iran)
+remote_port = 443       # Public port (Foreign server)
+
+# Pre-shared key (MUST be same on both sides, 16+ chars)
+secret_key = "your-super-secret-key-change-this!"
+
+# Logging: debug, info, warn, error
+log_level = "info"
+
+# Performance
+workers = 0             # 0 = auto (use all CPU cores)
+mux_capacity = 256      # Max concurrent streams per tunnel
+buffer_size = 32768     # I/O buffer size (bytes)
+heartbeat_sec = 15      # Keepalive interval
+
+# Reconnection (client mode)
+reconnect_sec = 3       # Base reconnect delay
+max_reconnect = 0       # 0 = infinite retries
+
+# Anti-DPI Obfuscation
+obfuscation = "tls"     # "tls" | "http" | "raw"
+tls_sni = "cloudflare.com"  # Fake SNI domain
+padding_range = [64, 256]    # Random padding bytes range
+fragment_range = [1, 5]      # TCP fragment count range
+
+# Multipath (experimental)
+enable_multipath = false
