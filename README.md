@@ -4,7 +4,7 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-v1.2.0-blue.svg)](https://github.com/YOUR_USER/HesarTunnel/releases)
+[![Release](https://img.shields.io/badge/Release-v1.2.0-blue.svg)](https://github.com/Meytiz/HesarTunnel/releases)
 
 HesarTunnel is a high-performance reverse tunnel written in Go, designed to bypass Deep Packet Inspection (DPI) systems used in Iran, China, and Russia. It creates an encrypted, obfuscated tunnel between two servers without requiring domain names or TLS certificates.
 
@@ -30,7 +30,7 @@ HesarTunnel is a high-performance reverse tunnel written in Go, designed to bypa
 ## 🚀 Quick Start
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/HesarTunnel/main/hesar-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesar-manager.sh)
 ```
 
 ---
@@ -129,7 +129,7 @@ fragment_range = [1, 5]
 ## 🔧 Build from Source
 
 ```bash
-git clone https://github.com/YOUR_USER/HesarTunnel.git
+git clone https://github.com/Meytiz/HesarTunnel.git
 cd HesarTunnel
 CGO_ENABLED=0 go build -ldflags="-s -w" -o hesartunnel .
 ```
