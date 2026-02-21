@@ -29,9 +29,9 @@ HesarTunnel is a high-performance reverse tunnel written in Go, designed to bypa
 
 ## 🚀 Quick Start
 
-```bash
+\`\`\`bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesar-manager.sh)
-```
+\`\`\`
 
 ---
 
@@ -39,26 +39,26 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesa
 
 ### Foreign Server (Server Mode)
 
-```bash
+\`\`\`bash
 ./hesartunnel -mode server -port 4443 -key "your-secret-key-here"
-```
+\`\`\`
 
 ### Iran Server (Client Mode - Reverse)
 
-```bash
-./hesartunnel -mode client \
-  -server your-foreign-server.com \
-  -port 4443 \
-  -local 8080 \
-  -remote 443 \
+\`\`\`bash
+./hesartunnel -mode client \\
+  -server your-foreign-server.com \\
+  -port 4443 \\
+  -local 8080 \\
+  -remote 443 \\
   -key "your-secret-key-here"
-```
+\`\`\`
 
 ---
 
 ## 🏗️ Architecture
 
-```
+\`\`\`
 ┌─────────────────┐         ┌─────────────────────┐         ┌─────────────┐
 │   Users/Clients │ ──TCP──▶│   Foreign Server     │◀──────  │ Iran Server │
 │   (Internet)    │         │   (HesarTunnel SRV)  │ Reverse │ (HesarTunnel│
@@ -73,7 +73,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/hesa
                             │ Random Padding        │
                             │ TCP Fragmentation     │
                             └─────────────────────┘
-```
+\`\`\`
 
 ---
 
@@ -98,7 +98,7 @@ Uses pre-shared key (PSK) authentication with HKDF-SHA256 key derivation — no 
 
 ## ⚙️ Configuration
 
-```toml
+\`\`\`toml
 # /etc/hesartunnel/config.toml
 mode = "client"
 server_addr = "your-foreign-server.com"
@@ -110,7 +110,7 @@ obfuscation = "tls"
 tls_sni = "cloudflare.com"
 padding_range = [64, 256]
 fragment_range = [1, 5]
-```
+\`\`\`
 
 ---
 
@@ -128,11 +128,32 @@ fragment_range = [1, 5]
 
 ## 🔧 Build from Source
 
-```bash
+\`\`\`bash
 git clone https://github.com/Meytiz/HesarTunnel.git
 cd HesarTunnel
 CGO_ENABLED=0 go build -ldflags="-s -w" -o hesartunnel .
-```
+\`\`\`
+
+---
+
+## 🛡️ Handshake Protocol
+
+\`\`\`
+Client (Iran)                          Server (Foreign)
+     │                                        │
+     │─── [FakeClientHello] ────────────────▶│  (optional, auto-detected)
+     │                                        │
+     │─── [32-byte Salt] ──────────────────▶│  (raw TCP)
+     │                                        │
+     │    ┌─ Both derive key: ──────────────┐ │
+     │    │  HKDF(PSK, Salt, "hesartunnel") │ │
+     │    └─────────────────────────────────┘ │
+     │                                        │
+     │─── [Encrypted Auth] ────────────────▶│  (TLS record wrapped)
+     │                                        │
+     │◀══════ Mux Session ════════════════▶│  (encrypted + obfuscated)
+     │                                        │
+\`\`\`
 
 ---
 
