@@ -16,8 +16,11 @@ import (
 // Multiplexer runs multiple logical streams over a single encrypted connection.
 // This is critical for efficiency: one TCP connection, many tunneled ports.
 //
-// Frame format (after encryption):
+// Wire format (before encryption):
 //   [StreamID:4][Flags:1][Length:2][Payload:N]
+//
+// On the wire (after encryption):
+//   [EncLen:4][Nonce:24][Encrypted(frame)+Tag:16]
 //
 // Flags:
 //   0x01 = SYN  (new stream)
@@ -33,9 +36,8 @@ const (
 	FlagPING byte = 0x08
 	FlagPONG byte = 0x10
 
-	FrameHeaderSize = 7
-	MaxPayloadSize  = 16384
-	StreamBufferSize = 65536
+	FrameHeaderSize  = 7     // 4 (streamID) + 1 (flags) + 2 (length)
+	MaxPayloadSize   = 16384
 )
 
 type Mux struct {
@@ -43,6 +45,7 @@ type Mux struct {
 	cipher    *crypto.CipherSuite
 	streams   map[uint32]*Stream
 	streamsMu sync.RWMutex
+	writeMu   sync.Mutex        // protects concurrent conn.Write calls
 	nextID    atomic.Uint32
 	acceptCh  chan *Stream
 	closeCh   chan struct{}
@@ -55,6 +58,7 @@ type Stream struct {
 	id       uint32
 	mux      *Mux
 	readBuf  chan []byte
+	residual []byte         // leftover from partial reads
 	closed   atomic.Bool
 }
 
@@ -101,6 +105,9 @@ func (m *Mux) OpenStream() (*Stream, error) {
 
 	// Send SYN frame
 	if err := m.writeFrame(id, FlagSYN, nil); err != nil {
+		m.streamsMu.Lock()
+		delete(m.streams, id)
+		m.streamsMu.Unlock()
 		return nil, err
 	}
 
@@ -121,16 +128,17 @@ func (m *Mux) readLoop() {
 	defer m.Close()
 
 	for {
-		// Read encrypted frame
+		// Read 4-byte encrypted frame length prefix
 		lenBuf := make([]byte, 4)
 		if _, err := io.ReadFull(m.conn, lenBuf); err != nil {
 			return
 		}
 		encLen := binary.BigEndian.Uint32(lenBuf)
-		if encLen > MaxPayloadSize+1024 {
-			return // invalid frame
+		if encLen == 0 || encLen > MaxPayloadSize+1024 {
+			return // invalid frame size
 		}
 
+		// Read encrypted frame data
 		encData := make([]byte, encLen)
 		if _, err := io.ReadFull(m.conn, encData); err != nil {
 			return
@@ -139,36 +147,43 @@ func (m *Mux) readLoop() {
 		// Decrypt
 		frame, err := m.cipher.Decrypt(encData, nil)
 		if err != nil {
-			return // tampered data
+			return // tampered or wrong key
 		}
 
 		if len(frame) < FrameHeaderSize {
-			continue
+			continue // malformed frame, skip
 		}
 
 		// Parse frame header
 		streamID := binary.BigEndian.Uint32(frame[:4])
 		flags := frame[4]
-		payloadLen := binary.BigEndian.Uint16(frame[5:7])
-		payload := frame[7 : 7+payloadLen]
+		payloadLen := int(binary.BigEndian.Uint16(frame[5:7]))
 
+		// BOUNDS CHECK: ensure payloadLen doesn't exceed frame
+		if payloadLen > len(frame)-FrameHeaderSize {
+			continue // corrupted payloadLen, skip
+		}
+
+		payload := frame[FrameHeaderSize : FrameHeaderSize+payloadLen]
 		m.handleFrame(streamID, flags, payload)
 	}
 }
 
 func (m *Mux) handleFrame(streamID uint32, flags byte, payload []byte) {
+	// Handle keepalive first (no stream needed)
 	switch {
 	case flags&FlagPING != 0:
 		_ = m.writeFrame(streamID, FlagPONG, nil)
 		return
 	case flags&FlagPONG != 0:
-		return // keepalive response
+		return // keepalive response, nothing to do
 	}
 
 	m.streamsMu.RLock()
 	s, exists := m.streams[streamID]
 	m.streamsMu.RUnlock()
 
+	// Handle SYN: create new stream
 	if flags&FlagSYN != 0 && !exists {
 		s = &Stream{
 			id:      streamID,
@@ -182,25 +197,31 @@ func (m *Mux) handleFrame(streamID uint32, flags byte, payload []byte) {
 		select {
 		case m.acceptCh <- s:
 		default:
-			// Accept queue full, drop
+			// Accept queue full, reject stream
+			_ = m.writeFrame(streamID, FlagFIN, nil)
+			m.streamsMu.Lock()
+			delete(m.streams, streamID)
+			m.streamsMu.Unlock()
 		}
 		return
 	}
 
 	if s == nil {
-		return
+		return // unknown stream
 	}
 
+	// Handle DATA
 	if flags&FlagDATA != 0 && len(payload) > 0 {
 		data := make([]byte, len(payload))
 		copy(data, payload)
 		select {
 		case s.readBuf <- data:
 		default:
-			// Buffer full, apply backpressure
+			// Buffer full — this applies backpressure
 		}
 	}
 
+	// Handle FIN
 	if flags&FlagFIN != 0 {
 		s.closed.Store(true)
 		close(s.readBuf)
@@ -210,6 +231,8 @@ func (m *Mux) handleFrame(streamID uint32, flags byte, payload []byte) {
 	}
 }
 
+// writeFrame builds, encrypts, and sends a mux frame.
+// Thread-safe: uses writeMu to prevent interleaved writes.
 func (m *Mux) writeFrame(streamID uint32, flags byte, payload []byte) error {
 	frame := make([]byte, FrameHeaderSize+len(payload))
 	binary.BigEndian.PutUint32(frame[:4], streamID)
@@ -225,11 +248,15 @@ func (m *Mux) writeFrame(streamID uint32, flags byte, payload []byte) error {
 		return err
 	}
 
-	// Write length-prefixed encrypted frame
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(encrypted)))
+	// Build wire message: [4-byte length][encrypted data]
+	wireMsg := make([]byte, 4+len(encrypted))
+	binary.BigEndian.PutUint32(wireMsg[:4], uint32(len(encrypted)))
+	copy(wireMsg[4:], encrypted)
 
-	_, err = m.conn.Write(append(lenBuf, encrypted...))
+	// Write atomically under mutex to prevent interleaving
+	m.writeMu.Lock()
+	_, err = m.conn.Write(wireMsg)
+	m.writeMu.Unlock()
 	return err
 }
 
@@ -246,13 +273,37 @@ func (m *Mux) Close() error {
 	return nil
 }
 
-// Stream implements net.Conn-like interface.
+// ──────────────────────────────────────────────
+// Stream implements io.ReadWriteCloser + net.Conn
+// ──────────────────────────────────────────────
+
+// Read reads data from the stream.
+// Uses a residual buffer to handle cases where the incoming data chunk
+// is larger than the caller's buffer, preventing data loss.
 func (s *Stream) Read(buf []byte) (int, error) {
+	// Serve from residual first
+	if len(s.residual) > 0 {
+		n := copy(buf, s.residual)
+		if n < len(s.residual) {
+			s.residual = s.residual[n:]
+		} else {
+			s.residual = nil
+		}
+		return n, nil
+	}
+
+	// Wait for next data chunk from channel
 	data, ok := <-s.readBuf
 	if !ok {
 		return 0, io.EOF
 	}
+
 	n := copy(buf, data)
+	if n < len(data) {
+		// Store remainder for next Read call
+		s.residual = make([]byte, len(data)-n)
+		copy(s.residual, data[n:])
+	}
 	return n, nil
 }
 
@@ -277,13 +328,14 @@ func (s *Stream) Write(data []byte) (int, error) {
 
 func (s *Stream) Close() error {
 	if s.closed.Swap(true) {
-		return nil
+		return nil // already closed
 	}
 	return s.mux.writeFrame(s.id, FlagFIN, nil)
 }
 
-func (s *Stream) LocalAddr() net.Addr  { return s.mux.conn.LocalAddr() }
-func (s *Stream) RemoteAddr() net.Addr { return s.mux.conn.RemoteAddr() }
+// net.Conn interface compliance
+func (s *Stream) LocalAddr() net.Addr                { return s.mux.conn.LocalAddr() }
+func (s *Stream) RemoteAddr() net.Addr               { return s.mux.conn.RemoteAddr() }
 func (s *Stream) SetDeadline(t time.Time) error      { return nil }
-func (s *Stream) SetReadDeadline(t time.Time) error   { return nil }
-func (s *Stream) SetWriteDeadline(t time.Time) error  { return nil }
+func (s *Stream) SetReadDeadline(t time.Time) error  { return nil }
+func (s *Stream) SetWriteDeadline(t time.Time) error { return nil }
