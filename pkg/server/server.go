@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -20,17 +21,17 @@ import (
 // It accepts reverse tunnel connections from Iranian clients
 // and forwards external user traffic through the tunnel.
 type Server struct {
-	cfg      *config.Config
-	clients  map[string]*ClientSession
-	mu       sync.RWMutex
-	pool     *pool.BufferPool
+	cfg     *config.Config
+	clients map[string]*ClientSession
+	mu      sync.RWMutex
+	pool    *pool.BufferPool
 }
 
 type ClientSession struct {
-	mux       *mux.Mux
+	mux        *mux.Mux
 	remotePort int
-	listener  net.Listener
-	cancel    context.CancelFunc
+	listener   net.Listener
+	cancel     context.CancelFunc
 }
 
 func New(cfg *config.Config) *Server {
@@ -77,21 +78,56 @@ func (s *Server) handleTunnelClient(ctx context.Context, raw net.Conn) {
 	remoteAddr := raw.RemoteAddr().String()
 	log.Printf("[INFO] New tunnel client: %s", remoteAddr)
 
-	// Wrap connection with obfuscation layer
-	obfConn := obfuscation.WrapConn(raw, obfuscation.Config{
-		PaddingRange:  s.cfg.PaddingRange,
-		FragmentRange: s.cfg.FragmentRange,
-		SNI:           s.cfg.TLSSNI,
-	})
+	// ─── PHASE 1: Raw TCP handshake (pre-obfuscation) ───
+	//
+	// Protocol auto-detection:
+	//   - First byte 0x16 → Client sent FakeClientHello, consume it, then read salt
+	//   - Any other byte  → First byte is part of the 32-byte salt
+	//
+	// This ensures the server works regardless of client obfuscation setting.
 
-	// Perform handshake: receive salt + verify PSK
 	salt := make([]byte, 32)
-	if _, err := io.ReadFull(obfConn, salt); err != nil {
-		log.Printf("[WARN] Handshake failed (salt): %v", err)
+
+	firstByte := make([]byte, 1)
+	if _, err := io.ReadFull(raw, firstByte); err != nil {
+		log.Printf("[WARN] Handshake failed (read first byte): %v", err)
 		return
 	}
 
-	// Derive session key
+	if firstByte[0] == 0x16 {
+		// TLS ClientHello detected — consume the entire record
+		restHeader := make([]byte, 4)
+		if _, err := io.ReadFull(raw, restHeader); err != nil {
+			log.Printf("[WARN] Handshake failed (ClientHello header): %v", err)
+			return
+		}
+		recordLen := binary.BigEndian.Uint16(restHeader[2:4])
+		if recordLen > 16384 {
+			log.Printf("[WARN] Invalid ClientHello length: %d", recordLen)
+			return
+		}
+		helloPayload := make([]byte, recordLen)
+		if _, err := io.ReadFull(raw, helloPayload); err != nil {
+			log.Printf("[WARN] Handshake failed (ClientHello body): %v", err)
+			return
+		}
+		log.Printf("[DEBUG] Consumed FakeClientHello (%d bytes) from %s", recordLen, remoteAddr)
+
+		// Now read the 32-byte salt
+		if _, err := io.ReadFull(raw, salt); err != nil {
+			log.Printf("[WARN] Handshake failed (salt after hello): %v", err)
+			return
+		}
+	} else {
+		// No ClientHello — first byte is start of salt
+		salt[0] = firstByte[0]
+		if _, err := io.ReadFull(raw, salt[1:]); err != nil {
+			log.Printf("[WARN] Handshake failed (salt): %v", err)
+			return
+		}
+	}
+
+	// Derive session key from PSK + salt
 	key, err := crypto.DeriveKey(s.cfg.KeyHash[:], salt)
 	if err != nil {
 		log.Printf("[WARN] Key derivation failed: %v", err)
@@ -104,8 +140,16 @@ func (s *Server) handleTunnelClient(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	// Read encrypted auth token
-	authBuf := make([]byte, 256)
+	// ─── PHASE 2: Obfuscated connection (TLS record framing) ───
+
+	obfConn := obfuscation.WrapConn(raw, obfuscation.Config{
+		PaddingRange:  s.cfg.PaddingRange,
+		FragmentRange: s.cfg.FragmentRange,
+		SNI:           s.cfg.TLSSNI,
+	})
+
+	// Read encrypted auth token through obfuscated connection
+	authBuf := make([]byte, 512)
 	n, err := obfConn.Read(authBuf)
 	if err != nil {
 		log.Printf("[WARN] Auth read failed: %v", err)
@@ -118,12 +162,17 @@ func (s *Server) handleTunnelClient(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	// Parse tunnel config from auth data
-	tunnelCfg := parseTunnelConfig(authData)
+	// Parse tunnel config from auth data (with bounds check)
+	tunnelCfg, err := parseTunnelConfig(authData)
+	if err != nil {
+		log.Printf("[WARN] Invalid tunnel config from %s: %v", remoteAddr, err)
+		return
+	}
 	log.Printf("[INFO] Client authenticated: %s -> expose port %d",
 		remoteAddr, tunnelCfg.RemotePort)
 
-	// Create multiplexed session
+	// ─── PHASE 3: Multiplexed tunnel session ───
+
 	clientCtx, clientCancel := context.WithCancel(ctx)
 	defer clientCancel()
 
@@ -160,7 +209,7 @@ func (s *Server) handleTunnelClient(ctx context.Context, raw net.Conn) {
 	log.Printf("[INFO] ✓ Tunnel active: public :%d -> client %s",
 		tunnelCfg.RemotePort, remoteAddr)
 
-	// Heartbeat
+	// Heartbeat goroutine
 	go func() {
 		ticker := time.NewTicker(time.Duration(s.cfg.HeartbeatSec) * time.Second)
 		defer ticker.Stop()
@@ -177,12 +226,13 @@ func (s *Server) handleTunnelClient(ctx context.Context, raw net.Conn) {
 		}
 	}()
 
-	// Accept public connections and forward through tunnel
+	// Close public listener when context is cancelled
 	go func() {
 		<-clientCtx.Done()
 		pubListener.Close()
 	}()
 
+	// Accept public connections and forward through tunnel
 	for {
 		pubConn, err := pubListener.Accept()
 		if err != nil {
@@ -193,11 +243,11 @@ func (s *Server) handleTunnelClient(ctx context.Context, raw net.Conn) {
 				continue
 			}
 		}
-		go s.proxyConnection(clientCtx, pubConn, muxSession)
+		go s.proxyConnection(pubConn, muxSession)
 	}
 }
 
-func (s *Server) proxyConnection(ctx context.Context, pubConn net.Conn, m *mux.Mux) {
+func (s *Server) proxyConnection(pubConn net.Conn, m *mux.Mux) {
 	defer pubConn.Close()
 
 	// Open a new mux stream to the client
@@ -216,15 +266,15 @@ func (s *Server) biCopy(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	copy := func(dst io.Writer, src io.Reader) {
+	copyFn := func(dst io.Writer, src io.Reader) {
 		defer wg.Done()
 		buf := s.pool.Get()
 		defer s.pool.Put(buf)
 		io.CopyBuffer(dst, src, buf)
 	}
 
-	go copy(a, b)
-	go copy(b, a)
+	go copyFn(a, b)
+	go copyFn(b, a)
 	wg.Wait()
 }
 
@@ -232,8 +282,13 @@ type tunnelConfig struct {
 	RemotePort int
 }
 
-func parseTunnelConfig(data []byte) tunnelConfig {
-	// Simple format: first 2 bytes = remote port
-	port := int(data[0])<<8 | int(data[1])
-	return tunnelConfig{RemotePort: port}
+func parseTunnelConfig(data []byte) (tunnelConfig, error) {
+	if len(data) < 2 {
+		return tunnelConfig{}, fmt.Errorf("auth data too short: %d bytes", len(data))
+	}
+	port := int(binary.BigEndian.Uint16(data[:2]))
+	if port == 0 || port > 65535 {
+		return tunnelConfig{}, fmt.Errorf("invalid port: %d", port)
+	}
+	return tunnelConfig{RemotePort: port}, nil
 }
