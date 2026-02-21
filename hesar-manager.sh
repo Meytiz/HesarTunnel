@@ -177,20 +177,59 @@ configure_tunnel() {
     read -p "  Control port [4443]: " PORT
     PORT=${PORT:-4443}
 
-    AUTO_KEY=$(openssl rand -hex 16)
-    read -p "  Secret key (Enter = auto-generate): " SECRET_KEY
+    # ──────────────────────────────────────────────
+    # Secret Key — auto-generate on Enter
+    # ──────────────────────────────────────────────
+    AUTO_KEY=$(generate_secret_key)
+    echo ""
+    echo -e "  ${YELLOW}Press Enter to auto-generate a secure key${NC}"
+    echo -e "  ${YELLOW}or type your own (min 16 chars):${NC}"
+    read -p "  Secret key [auto]: " SECRET_KEY
+
     if [[ -z "$SECRET_KEY" ]]; then
         SECRET_KEY="$AUTO_KEY"
-        log_info "Auto-generated key: ${YELLOW}${SECRET_KEY}${NC}"
+        echo ""
+        echo -e "  ┌──────────────────────────────────────────┐"
+        echo -e "  │  ${GREEN}Auto-generated key:${NC}                      │"
+        echo -e "  │  ${BOLD}${YELLOW}${SECRET_KEY}${NC}  │"
+        echo -e "  │                                          │"
+        echo -e "  │  ${RED}⚠ Save this key! You need it on both${NC}     │"
+        echo -e "  │  ${RED}  server and client sides.${NC}                │"
+        echo -e "  └──────────────────────────────────────────┘"
+        echo ""
     elif [[ ${#SECRET_KEY} -lt 16 ]]; then
         log_error "Key must be at least 16 characters"
         return
     fi
 
     if [[ $MODE == "client" ]]; then
-        read -p "  Foreign server address: " SERVER_ADDR
-        read -p "  Local port to expose: " LOCAL_PORT
-        read -p "  Remote public port: " REMOTE_PORT
+
+        # ─── Server Address (اجباری) ───
+        while true; do
+            read -p "  Foreign server address: " SERVER_ADDR
+            if [[ -n "$SERVER_ADDR" ]]; then
+                break
+            fi
+            log_error "Server address is required!"
+        done
+
+        # ─── Local Port (اجباری) ───
+        while true; do
+            read -p "  Local port to expose: " LOCAL_PORT
+            if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && (( LOCAL_PORT >= 1 && LOCAL_PORT <= 65535 )); then
+                break
+            fi
+            log_error "Enter a valid port number (1-65535)"
+        done
+
+        # ─── Remote Port (اجباری) ───
+        while true; do
+            read -p "  Remote public port: " REMOTE_PORT
+            if [[ "$REMOTE_PORT" =~ ^[0-9]+$ ]] && (( REMOTE_PORT >= 1 && REMOTE_PORT <= 65535 )); then
+                break
+            fi
+            log_error "Enter a valid port number (1-65535)"
+        done
 
         echo ""
         echo -e "  ${CYAN}Anti-DPI obfuscation:${NC}"
@@ -254,7 +293,6 @@ EOF
     log_info "Config saved to $CONFIG_FILE"
     create_service
 }
-
 # ─────────────────────────────────────────────────────────
 # Systemd Service
 # ─────────────────────────────────────────────────────────
