@@ -11,7 +11,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────
-VERSION="1.2.0"
+APP_VERSION="1.2.0"
 REPO="Meytiz/HesarTunnel"
 BINARY_NAME="hesartunnel"
 INSTALL_DIR="/usr/local/bin"
@@ -39,7 +39,7 @@ show_banner() {
     echo "  ╩ ╩└─┘└─┘┴ ┴┴└─ ╩ └─┘┘└┘┘└┘└─┘┴─┘"
     echo -e "${NC}"
     echo -e "  ${BOLD}Secure Reverse Tunnel with Anti-DPI${NC}"
-    echo -e "  ${PURPLE}Version: ${VERSION}${NC}"
+    echo -e "  ${PURPLE}Version: ${APP_VERSION}${NC}"
     echo -e "  ─────────────────────────────────────"
     echo ""
 }
@@ -106,8 +106,8 @@ install_hesartunnel() {
     log_info "Dependencies installed"
 
     # Download binary
-    log_step "Downloading HesarTunnel v${VERSION}..."
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${BINARY_NAME}_${VERSION}_linux_${ARCH}.tar.gz"
+    log_step "Downloading HesarTunnel v${APP_VERSION}..."
+    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${APP_VERSION}/${BINARY_NAME}_${APP_VERSION}_linux_${ARCH}.tar.gz"
 
     cd /tmp
     if curl -fsSL "$DOWNLOAD_URL" -o hesartunnel.tar.gz; then
@@ -158,7 +158,6 @@ configure_tunnel() {
     echo -e "  ${BOLD}┌─ Tunnel Configuration ─────────────────┐${NC}"
     echo ""
 
-    # Mode selection
     echo -e "  ${CYAN}Select mode:${NC}"
     echo -e "    ${GREEN}1)${NC} Server (Foreign VPS)"
     echo -e "    ${GREEN}2)${NC} Client (Iran Server - Reverse)"
@@ -171,7 +170,6 @@ configure_tunnel() {
         *) log_error "Invalid choice"; return ;;
     esac
 
-    # Common settings
     read -p "  Control port [4443]: " PORT
     PORT=${PORT:-4443}
 
@@ -181,7 +179,6 @@ configure_tunnel() {
         return
     fi
 
-    # Client-specific settings
     if [[ $MODE == "client" ]]; then
         read -p "  Foreign server address: " SERVER_ADDR
         read -p "  Local port to expose: " LOCAL_PORT
@@ -207,7 +204,6 @@ configure_tunnel() {
         fi
     fi
 
-    # Generate config
     CONFIG_FILE="$CONFIG_DIR/config.toml"
 
     cat > $CONFIG_FILE <<EOF
@@ -248,8 +244,6 @@ EOF
     fi
 
     log_info "Config saved to $CONFIG_FILE"
-
-    # Create systemd service
     create_service
 }
 
@@ -272,7 +266,6 @@ LimitNOFILE=65536
 StandardOutput=append:$LOG_FILE
 StandardError=append:$LOG_FILE
 
-# Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
