@@ -84,6 +84,27 @@ detect_arch() {
 }
 
 # ─────────────────────────────────────────────────────────
+# Generate Random Secret Key
+# ─────────────────────────────────────────────────────────
+generate_secret_key() {
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex 16
+    elif [[ -r /dev/urandom ]]; then
+        cat /dev/urandom | tr -dc 'a-f0-9' | head -c 32
+    else
+        cat /proc/sys/kernel/random/uuid | tr -d '-'
+    fi
+}
+
+# ─────────────────────────────────────────────────────────
+# Validate Port Number
+# ─────────────────────────────────────────────────────────
+is_valid_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+# ─────────────────────────────────────────────────────────
 # Install
 # ─────────────────────────────────────────────────────────
 install_hesartunnel() {
@@ -92,7 +113,6 @@ install_hesartunnel() {
     detect_arch
     log_info "OS: $OS $OS_VERSION | Arch: $ARCH"
 
-    # Install dependencies
     log_step "Installing dependencies..."
     case $OS in
         ubuntu|debian)
@@ -105,7 +125,6 @@ install_hesartunnel() {
     esac
     log_info "Dependencies installed"
 
-    # Download binary
     log_step "Downloading HesarTunnel v${APP_VERSION}..."
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${APP_VERSION}/${BINARY_NAME}_${APP_VERSION}_linux_${ARCH}.tar.gz"
 
@@ -121,10 +140,8 @@ install_hesartunnel() {
         install_from_source
     fi
 
-    # Create config directory
     mkdir -p $CONFIG_DIR
     log_info "Config directory: $CONFIG_DIR"
-
     log_info "Installation complete!"
     echo ""
 }
@@ -162,6 +179,7 @@ configure_tunnel() {
     echo -e "  ${BOLD}┌─ Tunnel Configuration ─────────────────┐${NC}"
     echo ""
 
+    # ─── Mode Selection ───
     echo -e "  ${CYAN}Select mode:${NC}"
     echo -e "    ${GREEN}1)${NC} Server (Foreign VPS)"
     echo -e "    ${GREEN}2)${NC} Client (Iran Server - Reverse)"
@@ -174,12 +192,17 @@ configure_tunnel() {
         *) log_error "Invalid choice"; return ;;
     esac
 
-    read -p "  Control port [4443]: " PORT
-    PORT=${PORT:-4443}
+    # ─── Control Port (with validation) ───
+    while true; do
+        read -p "  Control port [4443]: " PORT
+        PORT=${PORT:-4443}
+        if is_valid_port "$PORT"; then
+            break
+        fi
+        log_error "Invalid port! Enter a number between 1-65535"
+    done
 
-    # ──────────────────────────────────────────────
-    # Secret Key — auto-generate on Enter
-    # ──────────────────────────────────────────────
+    # ─── Secret Key (auto-generate on Enter) ───
     AUTO_KEY=$(generate_secret_key)
     echo ""
     echo -e "  ${YELLOW}Press Enter to auto-generate a secure key${NC}"
@@ -202,9 +225,10 @@ configure_tunnel() {
         return
     fi
 
+    # ─── Client-specific fields ───
     if [[ $MODE == "client" ]]; then
 
-        # ─── Server Address (اجباری) ───
+        # Server Address (required)
         while true; do
             read -p "  Foreign server address: " SERVER_ADDR
             if [[ -n "$SERVER_ADDR" ]]; then
@@ -213,19 +237,19 @@ configure_tunnel() {
             log_error "Server address is required!"
         done
 
-        # ─── Local Port (اجباری) ───
+        # Local Port (required + validated)
         while true; do
             read -p "  Local port to expose: " LOCAL_PORT
-            if [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] && (( LOCAL_PORT >= 1 && LOCAL_PORT <= 65535 )); then
+            if is_valid_port "$LOCAL_PORT"; then
                 break
             fi
             log_error "Enter a valid port number (1-65535)"
         done
 
-        # ─── Remote Port (اجباری) ───
+        # Remote Port (required + validated)
         while true; do
             read -p "  Remote public port: " REMOTE_PORT
-            if [[ "$REMOTE_PORT" =~ ^[0-9]+$ ]] && (( REMOTE_PORT >= 1 && REMOTE_PORT <= 65535 )); then
+            if is_valid_port "$REMOTE_PORT"; then
                 break
             fi
             log_error "Enter a valid port number (1-65535)"
@@ -251,6 +275,7 @@ configure_tunnel() {
         fi
     fi
 
+    # ─── Write Config ───
     CONFIG_FILE="$CONFIG_DIR/config.toml"
 
     cat > $CONFIG_FILE <<EOF
@@ -293,6 +318,7 @@ EOF
     log_info "Config saved to $CONFIG_FILE"
     create_service
 }
+
 # ─────────────────────────────────────────────────────────
 # Systemd Service
 # ─────────────────────────────────────────────────────────
