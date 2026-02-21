@@ -11,7 +11,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────
-APP_VERSION="1.2.0"
+APP_VERSION="1.1.0"
 REPO="Meytiz/HesarTunnel"
 BINARY_NAME="hesartunnel"
 INSTALL_DIR="/usr/local/bin"
@@ -135,21 +135,22 @@ install_from_source() {
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz
     rm -rf /usr/local/go
     tar -C /usr/local -xzf /tmp/go.tar.gz
-    export PATH=$PATH:/usr/local/go/bin
+    export PATH="/usr/local/go/bin:$PATH"
     rm -f /tmp/go.tar.gz
 
-    log_step "Cloning repository..."
-    cd /tmp
-    git clone "https://github.com/${REPO}.git" hesartunnel-src
-    cd hesartunnel-src
+    log_step "Cloning & building..."
+    BUILD_DIR=$(mktemp -d)
+    trap "rm -rf $BUILD_DIR" EXIT
+
+    cd "$BUILD_DIR"
+    git clone --depth 1 "https://github.com/${REPO}.git" src
+    cd src
 
     log_step "Resolving dependencies..."
-    go mod tidy # این خط را اضافه کنید
+    go mod tidy >/dev/null 2>&1
 
     log_step "Building..."
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o $INSTALL_DIR/$BINARY_NAME .
-    cd /
-    rm -rf /tmp/hesartunnel-src
+    CGO_ENABLED=0 go build -ldflags="-s -w" -o "$INSTALL_DIR/$BINARY_NAME" .
 
     log_info "Built from source successfully"
 }
