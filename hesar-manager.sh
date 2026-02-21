@@ -177,8 +177,12 @@ configure_tunnel() {
     read -p "  Control port [4443]: " PORT
     PORT=${PORT:-4443}
 
-    read -p "  Secret key (16+ chars): " SECRET_KEY
-    if [[ ${#SECRET_KEY} -lt 16 ]]; then
+    AUTO_KEY=$(openssl rand -hex 16)
+    read -p "  Secret key (Enter = auto-generate): " SECRET_KEY
+    if [[ -z "$SECRET_KEY" ]]; then
+        SECRET_KEY="$AUTO_KEY"
+        log_info "Auto-generated key: ${YELLOW}${SECRET_KEY}${NC}"
+    elif [[ ${#SECRET_KEY} -lt 16 ]]; then
         log_error "Key must be at least 16 characters"
         return
     fi
