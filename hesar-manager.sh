@@ -143,6 +143,9 @@ install_from_source() {
     git clone "https://github.com/${REPO}.git" hesartunnel-src
     cd hesartunnel-src
 
+    log_step "Resolving dependencies..."
+    go mod tidy # این خط را اضافه کنید
+
     log_step "Building..."
     CGO_ENABLED=0 go build -ldflags="-s -w" -o $INSTALL_DIR/$BINARY_NAME .
     cd /
