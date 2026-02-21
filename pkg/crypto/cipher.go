@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"sync"
 	"sync/atomic"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -16,12 +15,11 @@ import (
 
 // CipherSuite provides authenticated encryption using
 // XChaCha20-Poly1305 with HKDF key derivation.
-// Chosen for: speed on ARM/x86 without AES-NI, 
+// Chosen for: speed on ARM/x86 without AES-NI,
 // constant-time operations, 192-bit nonce (no reuse risk).
 type CipherSuite struct {
 	aead     cipher.AEAD
 	nonceCtr atomic.Uint64
-	mu       sync.Mutex
 }
 
 // DeriveKey uses HKDF-SHA256 to derive encryption key from PSK + salt.
@@ -79,10 +77,18 @@ func (cs *CipherSuite) Decrypt(ciphertext, ad []byte) ([]byte, error) {
 }
 
 // GenerateSalt creates a random 32-byte salt for key derivation.
+// Ensures first byte is not 0x16 to avoid confusion with TLS ClientHello
+// during the auto-detection handshake phase.
 func GenerateSalt() ([]byte, error) {
 	salt := make([]byte, 32)
-	_, err := rand.Read(salt)
-	return salt, err
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	// Avoid 0x16 (TLS Handshake) as first byte for protocol disambiguation
+	if salt[0] == 0x16 {
+		salt[0] ^= 0xFF
+	}
+	return salt, nil
 }
 
 // Overhead returns the total overhead per encrypted frame.
