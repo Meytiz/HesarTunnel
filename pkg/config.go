@@ -18,11 +18,13 @@ type Config struct {
 }
 
 type TunnelConfig struct {
-	Protocol    string `toml:"protocol"`
-	TunnelPort  int    `toml:"tunnel_port"`
-	RemoteIP    string `toml:"remote_ip"`
-	ConfigPorts string `toml:"config_ports"`
-	SecretKey   string `toml:"secret_key"`
+	Protocol      string `toml:"protocol"`
+	TunnelPort    int    `toml:"tunnel_port"`
+	RemoteIP      string `toml:"remote_ip"`
+	ConfigPorts   string `toml:"config_ports"`
+	SecretKey     string `toml:"secret_key"`
+	ServerBind    string `toml:"server_bind"`     // Server: forward address (e.g., 127.0.0.1)
+	ClientForward string `toml:"client_forward"`  // Client: listen address (e.g., 0.0.0.0)
 }
 
 type CryptoConfig struct {
@@ -76,6 +78,12 @@ func setDefaults(cfg *Config) {
 	if cfg.Tunnel.RemoteIP == "" {
 		cfg.Tunnel.RemoteIP = "0.0.0.0"
 	}
+	if cfg.Tunnel.ServerBind == "" {
+		cfg.Tunnel.ServerBind = "127.0.0.1"
+	}
+	if cfg.Tunnel.ClientForward == "" {
+		cfg.Tunnel.ClientForward = "0.0.0.0"
+	}
 	if cfg.Crypto.Method == "" {
 		cfg.Crypto.Method = "chacha20-poly1305"
 	}
@@ -127,24 +135,32 @@ func validate(cfg *Config) error {
 	// Protocol
 	switch cfg.Tunnel.Protocol {
 	case "tcp", "kcp":
-		// valid
 	default:
 		return fmt.Errorf("invalid protocol '%s': must be 'tcp' or 'kcp'", cfg.Tunnel.Protocol)
 	}
 
-	// Port
+	// Tunnel port
 	if cfg.Tunnel.TunnelPort < 1 || cfg.Tunnel.TunnelPort > 65535 {
 		return fmt.Errorf("tunnel_port %d out of range (1-65535)", cfg.Tunnel.TunnelPort)
 	}
 
-	// Remote IP validation (for client mode, 0.0.0.0 is for server)
+	// Remote IP
 	if cfg.Tunnel.RemoteIP != "0.0.0.0" {
 		if ip := net.ParseIP(cfg.Tunnel.RemoteIP); ip == nil {
-			// Try resolving as hostname
 			if _, err := net.LookupHost(cfg.Tunnel.RemoteIP); err != nil {
 				return fmt.Errorf("invalid remote_ip '%s': not a valid IP or hostname", cfg.Tunnel.RemoteIP)
 			}
 		}
+	}
+
+	// ServerBind
+	if ip := net.ParseIP(cfg.Tunnel.ServerBind); ip == nil {
+		return fmt.Errorf("invalid server_bind '%s': must be a valid IP", cfg.Tunnel.ServerBind)
+	}
+
+	// ClientForward
+	if ip := net.ParseIP(cfg.Tunnel.ClientForward); ip == nil {
+		return fmt.Errorf("invalid client_forward '%s': must be a valid IP", cfg.Tunnel.ClientForward)
 	}
 
 	// Config ports
@@ -173,27 +189,24 @@ func validate(cfg *Config) error {
 	// Crypto method
 	switch cfg.Crypto.Method {
 	case "chacha20-poly1305", "aes-256-gcm":
-		// valid
 	default:
-		return fmt.Errorf("invalid crypto method '%s': use 'chacha20-poly1305' or 'aes-256-gcm'", cfg.Crypto.Method)
+		return fmt.Errorf("invalid crypto method '%s'", cfg.Crypto.Method)
 	}
 
-	// Obfs mode
+	// Obfuscation
 	if cfg.Crypto.Obfuscation {
 		switch cfg.Crypto.ObfsMode {
 		case "tls-hello", "http", "random-padding":
-			// valid
 		default:
-			return fmt.Errorf("invalid obfs_mode '%s': use 'tls-hello', 'http', or 'random-padding'", cfg.Crypto.ObfsMode)
+			return fmt.Errorf("invalid obfs_mode '%s'", cfg.Crypto.ObfsMode)
 		}
 	}
 
 	// KCP preset
 	switch cfg.KCP.Preset {
 	case "fast3", "fast2", "fast", "normal":
-		// valid
 	default:
-		return fmt.Errorf("invalid KCP preset '%s': use 'fast3', 'fast2', 'fast', or 'normal'", cfg.KCP.Preset)
+		return fmt.Errorf("invalid KCP preset '%s'", cfg.KCP.Preset)
 	}
 
 	return nil
@@ -217,7 +230,6 @@ func ParsePorts(portSpec string) ([]int, error) {
 		}
 
 		if strings.Contains(part, "-") {
-			// Range: "80-100"
 			rangeParts := strings.SplitN(part, "-", 2)
 			if len(rangeParts) != 2 {
 				return nil, fmt.Errorf("invalid port range format: '%s'", part)
@@ -240,7 +252,7 @@ func ParsePorts(portSpec string) ([]int, error) {
 				return nil, fmt.Errorf("invalid port range: start %d > end %d", start, end)
 			}
 			if end-start > 500 {
-				return nil, fmt.Errorf("port range too large: %d-%d (max 500 ports per range)", start, end)
+				return nil, fmt.Errorf("port range too large: %d-%d (max 500)", start, end)
 			}
 			for p := start; p <= end; p++ {
 				if !seen[p] {
@@ -249,7 +261,6 @@ func ParsePorts(portSpec string) ([]int, error) {
 				}
 			}
 		} else {
-			// Single port
 			p, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, fmt.Errorf("invalid port number '%s': %w", part, err)
@@ -265,7 +276,7 @@ func ParsePorts(portSpec string) ([]int, error) {
 	}
 
 	if len(ports) == 0 {
-		return nil, fmt.Errorf("no valid ports found in specification '%s'", portSpec)
+		return nil, fmt.Errorf("no valid ports found")
 	}
 
 	return ports, nil
