@@ -116,4 +116,74 @@ func UnmarshalFrame(r io.Reader) (*Frame, error) {
 	msgType := hdr[2]
 	flags := hdr[3]
 	connID := binary.BigEndian.Uint32(hdr[4:8])
-	port := 
+	port := binary.BigEndian.Uint16(hdr[8:10])
+	payloadLen := binary.BigEndian.Uint16(hdr[10:12])
+
+	if payloadLen > MaxPayload {
+		return nil, fmt.Errorf("payload length too large: %d", payloadLen)
+	}
+
+	var payload []byte
+	if payloadLen > 0 {
+		payload = make([]byte, payloadLen)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, fmt.Errorf("read payload (%d bytes): %w", payloadLen, err)
+		}
+	}
+
+	return &Frame{
+		Type:    msgType,
+		Flags:   flags,
+		ConnID:  connID,
+		Port:    port,
+		Payload: payload,
+	}, nil
+}
+
+// NewDataFrame creates a data frame
+func NewDataFrame(connID uint32, port uint16, data []byte) *Frame {
+	return &Frame{
+		Type:    MsgData,
+		Flags:   FlagNone,
+		ConnID:  connID,
+		Port:    port,
+		Payload: data,
+	}
+}
+
+// NewControlFrame creates a control frame (no payload)
+func NewControlFrame(msgType byte, connID uint32, port uint16) *Frame {
+	return &Frame{
+		Type:   msgType,
+		Flags:  FlagNone,
+		ConnID: connID,
+		Port:   port,
+	}
+}
+
+// EncodePortMap serializes a list of ports
+func EncodePortMap(ports []int) []byte {
+	buf := make([]byte, 2+len(ports)*2)
+	binary.BigEndian.PutUint16(buf[0:2], uint16(len(ports)))
+	for i, port := range ports {
+		binary.BigEndian.PutUint16(buf[2+i*2:4+i*2], uint16(port))
+	}
+	return buf
+}
+
+// DecodePortMap deserializes a list of ports
+func DecodePortMap(data []byte) ([]int, error) {
+	if len(data) < 2 {
+		return nil, fmt.Errorf("port map data too short: %d bytes", len(data))
+	}
+	count := int(binary.BigEndian.Uint16(data[0:2]))
+	expected := 2 + count*2
+	if len(data) < expected {
+		return nil, fmt.Errorf("port map data incomplete: need %d bytes, got %d", expected, len(data))
+	}
+	ports := make([]int, count)
+	for i := 0; i < count; i++ {
+		ports[i] = int(binary.BigEndian.Uint16(data[2+i*2 : 4+i*2]))
+	}
+	return ports, nil
+}
