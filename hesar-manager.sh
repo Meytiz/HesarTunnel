@@ -324,8 +324,21 @@ write_config() {
     local remote_ip="$3"
     local config_ports="$4"
     local secret_key="$5"
+    local mode="$6"    # "client" or "server"
 
     mkdir -p "$CONFIG_DIR"
+
+    # تنظیم خودکار bind/forward بر اساس mode
+    local server_bind="127.0.0.1"
+    local client_forward="0.0.0.0"
+
+    if [[ "$mode" == "server" ]]; then
+        server_bind="127.0.0.1"     # Forward to Xray on localhost
+        client_forward="0.0.0.0"    # Not used on server
+    else
+        server_bind="127.0.0.1"     # Not used on client
+        client_forward="0.0.0.0"    # Listen for users from everywhere
+    fi
 
     cat > "$CONFIG_FILE" << EOF
 [tunnel]
@@ -334,6 +347,8 @@ tunnel_port = ${tunnel_port}
 remote_ip = "${remote_ip}"
 config_ports = "${config_ports}"
 secret_key = "${secret_key}"
+server_bind = "${server_bind}"
+client_forward = "${client_forward}"
 
 [crypto]
 method = "chacha20-poly1305"
