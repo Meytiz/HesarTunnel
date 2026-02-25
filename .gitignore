@@ -1,0 +1,23 @@
+# Binaries
+hesar-tunnel
+hesar-tunnel-*
+*.tar.gz
+checksums-*.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Runtime configs (may contain secrets)
+/config.toml
+!/config.toml
