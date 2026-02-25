@@ -2,15 +2,13 @@
 protocol = "tcp"
 tunnel_port = 4000
 remote_ip = "0.0.0.0"
-config_ports = "8880"
-secret_key = "your-secret-key"
+config_ports = "80,443"
+secret_key = "change-me-to-strong-key"
 
-# سرور خارج: آدرس forward به سرویس محلی (Xray)
-# معمولاً 127.0.0.1 چون Xray روی همان سرور است
+# Server (foreign): forward to local service address
 server_bind = "127.0.0.1"
 
-# سرور ایران: آدرس listen برای کاربران  
-# 0.0.0.0 = از همه جا قبول کن
+# Client (Iran): listen address for users
 client_forward = "0.0.0.0"
 
 [crypto]
