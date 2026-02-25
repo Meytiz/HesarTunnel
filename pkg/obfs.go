@@ -1,225 +1,105 @@
 package pkg
 
 import (
-	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
-	"math/big"
+	"io"
+	"sync/atomic"
+
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 )
 
-// Obfuscator applies traffic obfuscation to resist DPI
-type Obfuscator struct {
-	mode    string
-	enabled bool
+type CryptoEngine struct {
+	aead    cipher.AEAD
+	counter uint64
+	prefix  []byte
 }
 
-// NewObfuscator creates a new obfuscator
-func NewObfuscator(mode string, enabled bool) *Obfuscator {
-	return &Obfuscator{
-		mode:    mode,
-		enabled: enabled,
-	}
-}
+func NewCryptoEngine(method, key string) (*CryptoEngine, error) {
+	salt := deriveSalt(key)
+	info := []byte("HesarTunnel-v2")
+	kdf := hkdf.New(sha256.New, []byte(key), salt, info)
 
-// Obfuscate wraps data to disguise traffic pattern
-func (o *Obfuscator) Obfuscate(data []byte) ([]byte, error) {
-	if !o.enabled || len(data) == 0 {
-		return data, nil
-	}
+	var aead cipher.AEAD
+	var err error
 
-	switch o.mode {
-	case "tls-hello":
-		return o.wrapTLS(data)
-	case "http":
-		return o.wrapHTTP(data)
-	case "random-padding":
-		return o.wrapPadding(data)
+	switch method {
+	case "chacha20-poly1305":
+		k := make([]byte, chacha20poly1305.KeySize)
+		if _, err = io.ReadFull(kdf, k); err != nil {
+			return nil, fmt.Errorf("key derive: %w", err)
+		}
+		aead, err = chacha20poly1305.NewX(k)
+		if err != nil {
+			return nil, fmt.Errorf("chacha20 init: %w", err)
+		}
+
+	case "aes-256-gcm":
+		k := make([]byte, 32)
+		if _, err = io.ReadFull(kdf, k); err != nil {
+			return nil, fmt.Errorf("key derive: %w", err)
+		}
+		block, err := aes.NewCipher(k)
+		if err != nil {
+			return nil, fmt.Errorf("aes init: %w", err)
+		}
+		aead, err = cipher.NewGCM(block)
+		if err != nil {
+			return nil, fmt.Errorf("gcm init: %w", err)
+		}
+
 	default:
-		return data, nil
+		return nil, fmt.Errorf("unknown method: %s", method)
 	}
+
+	prefix := make([]byte, 8)
+	rand.Read(prefix)
+
+	return &CryptoEngine{aead: aead, prefix: prefix}, nil
 }
 
-// Deobfuscate unwraps obfuscated data
-func (o *Obfuscator) Deobfuscate(data []byte) ([]byte, error) {
-	if !o.enabled || len(data) == 0 {
-		return data, nil
-	}
-
-	switch o.mode {
-	case "tls-hello":
-		return o.unwrapTLS(data)
-	case "http":
-		return o.unwrapHTTP(data)
-	case "random-padding":
-		return o.unwrapPadding(data)
-	default:
-		return data, nil
-	}
+func deriveSalt(key string) []byte {
+	h := sha256.Sum256([]byte("HesarTunnel-salt-" + key))
+	return h[:]
 }
 
-// ─── TLS 1.3 Record Obfuscation ─────────────────────────
-// Wraps data as TLS Application Data records
-// This is simpler and more reliable than faking ClientHello
-// DPI sees standard TLS 1.2/1.3 record layer
-
-func (o *Obfuscator) wrapTLS(data []byte) ([]byte, error) {
-	// TLS Application Data Record:
-	// [ContentType:1][Version:2][Length:2][Fragment:N]
-	//
-	// Content Type 0x17 = Application Data
-	// Version 0x0303 = TLS 1.2 (used even in TLS 1.3 record layer)
-	// Length = len(data)
-
-	dataLen := len(data)
-	if dataLen > 16384 { // TLS max record size
-		// Split into multiple records
-		var buf bytes.Buffer
-		for offset := 0; offset < dataLen; {
-			chunkSize := dataLen - offset
-			if chunkSize > 16384 {
-				chunkSize = 16384
-			}
-
-			buf.WriteByte(0x17) // Application Data
-			buf.Write([]byte{0x03, 0x03})
-			lenBytes := make([]byte, 2)
-			binary.BigEndian.PutUint16(lenBytes, uint16(chunkSize))
-			buf.Write(lenBytes)
-			buf.Write(data[offset : offset+chunkSize])
-
-			offset += chunkSize
-		}
-		return buf.Bytes(), nil
-	}
-
-	buf := make([]byte, 5+dataLen)
-	buf[0] = 0x17 // Application Data
-	buf[1] = 0x03
-	buf[2] = 0x03
-	binary.BigEndian.PutUint16(buf[3:5], uint16(dataLen))
-	copy(buf[5:], data)
-
-	return buf, nil
+func (ce *CryptoEngine) Encrypt(plaintext []byte) ([]byte, error) {
+	nonce := ce.makeNonce()
+	return ce.aead.Seal(nonce, nonce, plaintext, nil), nil
 }
 
-func (o *Obfuscator) unwrapTLS(data []byte) ([]byte, error) {
-	if len(data) < 5 {
-		return nil, fmt.Errorf("TLS record too short: %d bytes", len(data))
+func (ce *CryptoEngine) Decrypt(ciphertext []byte) ([]byte, error) {
+	ns := ce.aead.NonceSize()
+	if len(ciphertext) < ns+ce.aead.Overhead() {
+		return nil, fmt.Errorf("ciphertext too short")
 	}
-
-	// Can have multiple records concatenated
-	var result bytes.Buffer
-	offset := 0
-
-	for offset < len(data) {
-		if len(data)-offset < 5 {
-			return nil, fmt.Errorf("incomplete TLS record header at offset %d", offset)
-		}
-
-		contentType := data[offset]
-		if contentType != 0x17 {
-			return nil, fmt.Errorf("unexpected TLS content type: 0x%02x at offset %d", contentType, offset)
-		}
-
-		// Skip version check (we accept any 0x03,0x0X)
-		recordLen := int(binary.BigEndian.Uint16(data[offset+3 : offset+5]))
-
-		if offset+5+recordLen > len(data) {
-			return nil, fmt.Errorf("TLS record length exceeds data: need %d, have %d", offset+5+recordLen, len(data))
-		}
-
-		result.Write(data[offset+5 : offset+5+recordLen])
-		offset += 5 + recordLen
-	}
-
-	return result.Bytes(), nil
+	return ce.aead.Open(nil, ciphertext[:ns], ciphertext[ns:], nil)
 }
 
-// ─── HTTP Obfuscation ────────────────────────────────────
-// Wraps data in HTTP response format (simpler parsing)
-
-func (o *Obfuscator) wrapHTTP(data []byte) ([]byte, error) {
-	// Use fixed-length header for reliable parsing
-	// Format: "HTTP/1.1 200 OK\r\nContent-Length: XXXXX\r\n\r\n" + data
-	header := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Length: %05d\r\nConnection: keep-alive\r\n\r\n", len(data))
-
-	buf := make([]byte, len(header)+len(data))
-	copy(buf, header)
-	copy(buf[len(header):], data)
-
-	return buf, nil
+func (ce *CryptoEngine) makeNonce() []byte {
+	nonce := make([]byte, ce.aead.NonceSize())
+	c := atomic.AddUint64(&ce.counter, 1)
+	binary.BigEndian.PutUint64(nonce[0:8], c)
+	copy(nonce[8:], ce.prefix)
+	return nonce
 }
 
-func (o *Obfuscator) unwrapHTTP(data []byte) ([]byte, error) {
-	// Find the double CRLF that ends HTTP headers
-	idx := bytes.Index(data, []byte("\r\n\r\n"))
-	if idx == -1 {
-		return nil, fmt.Errorf("HTTP header terminator not found")
-	}
-	return data[idx+4:], nil
+func (ce *CryptoEngine) Overhead() int {
+	return ce.aead.NonceSize() + ce.aead.Overhead()
 }
 
-// ─── Random Padding Obfuscation ──────────────────────────
-// Format: [PaddingLen:2][Padding:N][DataLen:4][Data:M]
-
-func (o *Obfuscator) wrapPadding(data []byte) ([]byte, error) {
-	// Random padding between 16 and 128 bytes
-	paddingBig, err := rand.Int(rand.Reader, big.NewInt(113))
-	if err != nil {
-		return nil, fmt.Errorf("random generation failed: %w", err)
-	}
-	paddingLen := int(paddingBig.Int64()) + 16
-
-	totalLen := 2 + paddingLen + 4 + len(data)
-	buf := make([]byte, totalLen)
-
-	// Padding length
-	binary.BigEndian.PutUint16(buf[0:2], uint16(paddingLen))
-
-	// Random padding
-	rand.Read(buf[2 : 2+paddingLen])
-
-	// Data length
-	binary.BigEndian.PutUint32(buf[2+paddingLen:6+paddingLen], uint32(len(data)))
-
-	// Data
-	copy(buf[6+paddingLen:], data)
-
-	return buf, nil
+func GenerateAuthToken(key string) []byte {
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte("HesarTunnel-auth-v2"))
+	return mac.Sum(nil)
 }
 
-func (o *Obfuscator) unwrapPadding(data []byte) ([]byte, error) {
-	if len(data) < 6 {
-		return nil, fmt.Errorf("padded data too short: %d bytes", len(data))
-	}
-
-	paddingLen := int(binary.BigEndian.Uint16(data[0:2]))
-	if paddingLen > len(data)-6 {
-		return nil, fmt.Errorf("padding length %d exceeds data size %d", paddingLen, len(data))
-	}
-
-	dataLen := int(binary.BigEndian.Uint32(data[2+paddingLen : 6+paddingLen]))
-	if 6+paddingLen+dataLen > len(data) {
-		return nil, fmt.Errorf("data length %d exceeds available data", dataLen)
-	}
-
-	return data[6+paddingLen : 6+paddingLen+dataLen], nil
-}
-
-// Overhead returns maximum obfuscation overhead in bytes
-func (o *Obfuscator) Overhead() int {
-	if !o.enabled {
-		return 0
-	}
-	switch o.mode {
-	case "tls-hello":
-		return 5 // TLS record header
-	case "http":
-		return 80 // HTTP header
-	case "random-padding":
-		return 134 // 2 + 128(max padding) + 4
-	default:
-		return 0
-	}
+func VerifyAuthToken(token []byte, key string) bool {
+	return hmac.Equal(token, GenerateAuthToken(key))
 }
