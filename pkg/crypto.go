@@ -23,44 +23,35 @@ type CryptoEngine struct {
 
 func NewCryptoEngine(method, key string) (*CryptoEngine, error) {
 	salt := deriveSalt(key)
-	info := []byte("HesarTunnel-v2")
-	kdf := hkdf.New(sha256.New, []byte(key), salt, info)
-
+	kdf := hkdf.New(sha256.New, []byte(key), salt, []byte("HesarTunnel-v2"))
 	var aead cipher.AEAD
 	var err error
-
 	switch method {
 	case "chacha20-poly1305":
 		k := make([]byte, chacha20poly1305.KeySize)
 		if _, err = io.ReadFull(kdf, k); err != nil {
-			return nil, fmt.Errorf("key derive: %w", err)
+			return nil, err
 		}
 		aead, err = chacha20poly1305.NewX(k)
-		if err != nil {
-			return nil, fmt.Errorf("chacha20 init: %w", err)
-		}
-
 	case "aes-256-gcm":
 		k := make([]byte, 32)
 		if _, err = io.ReadFull(kdf, k); err != nil {
-			return nil, fmt.Errorf("key derive: %w", err)
+			return nil, err
 		}
-		block, err := aes.NewCipher(k)
+		var block cipher.Block
+		block, err = aes.NewCipher(k)
 		if err != nil {
-			return nil, fmt.Errorf("aes init: %w", err)
+			return nil, err
 		}
 		aead, err = cipher.NewGCM(block)
-		if err != nil {
-			return nil, fmt.Errorf("gcm init: %w", err)
-		}
-
 	default:
 		return nil, fmt.Errorf("unknown method: %s", method)
 	}
-
+	if err != nil {
+		return nil, err
+	}
 	prefix := make([]byte, 8)
 	rand.Read(prefix)
-
 	return &CryptoEngine{aead: aead, prefix: prefix}, nil
 }
 
@@ -86,12 +77,11 @@ func (ce *CryptoEngine) makeNonce() []byte {
 	nonce := make([]byte, ce.aead.NonceSize())
 	c := atomic.AddUint64(&ce.counter, 1)
 	binary.BigEndian.PutUint64(nonce[0:8], c)
-	copy(nonce[8:], ce.prefix)
+	n := copy(nonce[8:], ce.prefix)
+	if 8+n < len(nonce) {
+		rand.Read(nonce[8+n:])
+	}
 	return nonce
-}
-
-func (ce *CryptoEngine) Overhead() int {
-	return ce.aead.NonceSize() + ce.aead.Overhead()
 }
 
 func GenerateAuthToken(key string) []byte {
