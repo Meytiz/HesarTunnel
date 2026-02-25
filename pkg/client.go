@@ -10,11 +10,10 @@ import (
 	"time"
 )
 
-// Client runs on IRAN server
-// - Connects to foreign server (reverse tunnel)
-// - LISTENS on config ports (users connect here)
-// - Forwards user traffic through encrypted tunnel to foreign server
-// - Foreign server then forwards to local service (Xray)
+// Client runs on IRAN server.
+// Listens on config ports (users connect here).
+// Connects reverse tunnel to foreign server.
+// Forwards user traffic through tunnel.
 type Client struct {
 	cfg    *Config
 	crypto *CryptoEngine
@@ -24,28 +23,25 @@ type Client struct {
 	ports  []int
 
 	tunnelPool *TunnelPool
-	localConns *ConnMap // connID -> net.Conn (user connections)
+	localConns *ConnMap // connID -> user net.Conn
 
 	listeners []net.Listener
 	listMu    sync.Mutex
-
-	wg sync.WaitGroup
+	wg        sync.WaitGroup
 }
 
 func NewClient(cfg *Config) (*Client, error) {
-	crypto, err := NewCryptoEngine(cfg.Crypto.Method, cfg.Tunnel.SecretKey)
+	cr, err := NewCryptoEngine(cfg.Crypto.Method, cfg.Tunnel.SecretKey)
 	if err != nil {
-		return nil, fmt.Errorf("encryption engine init: %w", err)
+		return nil, fmt.Errorf("crypto: %w", err)
 	}
-
 	ports, err := ParsePorts(cfg.Tunnel.ConfigPorts)
 	if err != nil {
-		return nil, fmt.Errorf("port parsing: %w", err)
+		return nil, fmt.Errorf("ports: %w", err)
 	}
-
 	return &Client{
 		cfg:        cfg,
-		crypto:     crypto,
+		crypto:     cr,
 		obfs:       NewObfuscator(cfg.Crypto.ObfsMode, cfg.Crypto.Obfuscation),
 		pool:       NewBufferPool(cfg.Performance.BufferSize),
 		idGen:      NewConnIDGenerator(),
@@ -56,29 +52,31 @@ func NewClient(cfg *Config) (*Client, error) {
 }
 
 func (c *Client) Run(ctx context.Context) error {
-	remoteAddr := fmt.Sprintf("%s:%d", c.cfg.Tunnel.RemoteIP, c.cfg.Tunnel.TunnelPort)
-	log.Printf("[CLIENT] Target server: %s (protocol: %s, tunnels: %d)",
-		remoteAddr, c.cfg.Tunnel.Protocol, c.cfg.Performance.TunnelCount)
+	remote := fmt.Sprintf("%s:%d", c.cfg.Tunnel.RemoteIP, c.cfg.Tunnel.TunnelPort)
+	log.Printf("[CLIENT] Server: %s (%s, %d tunnels)", remote, c.cfg.Tunnel.Protocol, c.cfg.Performance.TunnelCount)
+	log.Printf("[CLIENT] Listen: %s, ports: %v", c.cfg.Tunnel.ClientForward, c.ports)
 
-	// Step 1: Start listening on config ports (users connect here)
+	// Listen on config ports for users
 	for _, port := range c.ports {
 		addr := fmt.Sprintf("%s:%d", c.cfg.Tunnel.ClientForward, port)
-		listener, err := net.Listen("tcp", addr)
+		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			log.Printf("[CLIENT] WARNING: Cannot listen on %s: %v", addr, err)
+			log.Printf("[CLIENT] WARNING: Cannot listen %s: %v", addr, err)
 			continue
 		}
-		c.addListener(listener)
+		c.listMu.Lock()
+		c.listeners = append(c.listeners, ln)
+		c.listMu.Unlock()
 		log.Printf("[CLIENT] Listening for users on %s", addr)
 
 		c.wg.Add(1)
-		go c.acceptUserConns(ctx, listener, port)
+		go c.acceptUsers(ctx, ln, port)
 	}
 
-	// Step 2: Connect reverse tunnels to foreign server
+	// Connect tunnels to foreign server
 	for i := 0; i < c.cfg.Performance.TunnelCount; i++ {
 		c.wg.Add(1)
-		go c.maintainTunnel(ctx, remoteAddr, i)
+		go c.maintainTunnel(ctx, remote, i)
 	}
 
 	<-ctx.Done()
@@ -88,111 +86,88 @@ func (c *Client) Run(ctx context.Context) error {
 func (c *Client) Shutdown(ctx context.Context) {
 	log.Println("[CLIENT] Shutting down...")
 
-	// Close all user listeners
 	c.listMu.Lock()
-	for _, l := range c.listeners {
-		l.Close()
+	for _, ln := range c.listeners {
+		ln.Close()
 	}
 	c.listeners = nil
 	c.listMu.Unlock()
 
 	c.tunnelPool.CloseAll()
-
-	c.localConns.Range(func(id uint32, v interface{}) bool {
-		if conn, ok := v.(net.Conn); ok {
-			conn.Close()
-		}
+	c.localConns.Range(func(_ uint32, v interface{}) bool {
+		v.(net.Conn).Close()
 		return true
 	})
 	c.localConns.Clear()
 
 	done := make(chan struct{})
-	go func() {
-		c.wg.Wait()
-		close(done)
-	}()
-
+	go func() { c.wg.Wait(); close(done) }()
 	select {
 	case <-done:
-		log.Println("[CLIENT] All goroutines stopped")
 	case <-ctx.Done():
-		log.Println("[CLIENT] Shutdown timeout")
 	}
+	log.Println("[CLIENT] Stopped")
 }
 
-func (c *Client) addListener(l net.Listener) {
-	c.listMu.Lock()
-	c.listeners = append(c.listeners, l)
-	c.listMu.Unlock()
-}
+// ─── Accept Users ────────────────────────────────────────
 
-// ─── Accept User Connections (on config ports) ───────────
-
-func (c *Client) acceptUserConns(ctx context.Context, listener net.Listener, port int) {
+func (c *Client) acceptUsers(ctx context.Context, ln net.Listener, port int) {
 	defer c.wg.Done()
-
-	tcpOpt := NewTCPTransport(c.cfg.Performance.Timeout, c.cfg.Performance.NoDelay)
+	opt := NewTCPTransport(c.cfg.Performance.Timeout, c.cfg.Performance.NoDelay)
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
 				return
 			default:
-				if isClosedError(err) {
+				if errClosed(err) {
 					return
 				}
-				log.Printf("[CLIENT] Port %d accept error: %v", port, err)
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
 		}
 
-		tcpOpt.Optimize(conn)
+		opt.Optimize(conn)
 
-		// Get a tunnel to send traffic through
-		tunnel := c.tunnelPool.Get()
-		if tunnel == nil {
-			log.Printf("[CLIENT] No tunnel available for port %d, rejecting user", port)
+		tun := c.tunnelPool.Get()
+		if tun == nil {
+			log.Printf("[CLIENT] No tunnel for port %d, reject", port)
 			conn.Close()
 			continue
 		}
 		c.tunnelPool.AdvanceIndex()
 
-		// Assign unique connection ID
-		connID := c.idGen.Next()
-		c.localConns.Store(connID, conn)
+		id := c.idGen.Next()
+		c.localConns.Store(id, conn)
 
-		log.Printf("[CLIENT] User connected on port %d (conn=%d) from %s", port, connID, conn.RemoteAddr())
-
-		// Notify server about new connection
-		if err := tunnel.WriteFrame(NewControlFrame(MsgNewConn, connID, uint16(port))); err != nil {
-			log.Printf("[CLIENT] Failed to notify server (conn=%d): %v", connID, err)
+		// Notify server: new user connected
+		if err := tun.WriteFrame(NewControlFrame(MsgNewConn, id, uint16(port))); err != nil {
 			conn.Close()
-			c.localConns.Delete(connID)
+			c.localConns.Delete(id)
 			continue
 		}
 
-		// Forward user data → tunnel
 		c.wg.Add(1)
-		go c.forwardUserToTunnel(ctx, conn, tunnel, uint16(port), connID)
+		go c.forwardUserToTunnel(ctx, conn, tun, uint16(port), id)
 	}
 }
 
-// Forward: user connection → encrypt → tunnel → server → Xray
-func (c *Client) forwardUserToTunnel(ctx context.Context, userConn net.Conn, tunnel *Mux, port uint16, connID uint32) {
+// Forward: user → encrypt → tunnel → server → Xray
+func (c *Client) forwardUserToTunnel(ctx context.Context, user net.Conn, tun *Mux, port uint16, id uint32) {
 	defer c.wg.Done()
 	defer func() {
-		tunnel.WriteFrame(NewControlFrame(MsgCloseConn, connID, port))
-		userConn.Close()
-		c.localConns.Delete(connID)
+		tun.WriteFrame(NewControlFrame(MsgCloseConn, id, port))
+		user.Close()
+		c.localConns.Delete(id)
 	}()
 
 	buf := c.pool.Get()
 	defer c.pool.Put(buf)
 
-	idleTimeout := time.Duration(c.cfg.Performance.MaxIdle) * time.Second
+	idle := time.Duration(c.cfg.Performance.MaxIdle) * time.Second
 
 	for {
 		select {
@@ -201,47 +176,38 @@ func (c *Client) forwardUserToTunnel(ctx context.Context, userConn net.Conn, tun
 		default:
 		}
 
-		userConn.SetReadDeadline(time.Now().Add(idleTimeout))
-		n, err := userConn.Read(buf)
+		user.SetReadDeadline(time.Now().Add(idle))
+		n, err := user.Read(buf)
 		if err != nil {
-			if err != io.EOF && !isTimeoutError(err) && !isClosedError(err) {
-				log.Printf("[CLIENT] User read error (conn=%d): %v", connID, err)
+			if err != io.EOF && !errTimeout(err) && !errClosed(err) {
+				log.Printf("[CLIENT] User read (conn=%d): %v", id, err)
 			}
 			return
 		}
-
 		if n == 0 {
 			continue
 		}
 
-		// Obfuscate + Encrypt
-		obfuscated, err := c.obfs.Obfuscate(buf[:n])
+		obf, err := c.obfs.Obfuscate(buf[:n])
 		if err != nil {
-			log.Printf("[CLIENT] Obfuscate error: %v", err)
 			return
 		}
-
-		encrypted, err := c.crypto.Encrypt(obfuscated)
+		enc, err := c.crypto.Encrypt(obf)
 		if err != nil {
-			log.Printf("[CLIENT] Encrypt error: %v", err)
 			return
 		}
-
-		// Send through tunnel to foreign server
-		if err := tunnel.WriteFrame(NewDataFrame(connID, port, encrypted)); err != nil {
-			log.Printf("[CLIENT] Tunnel write error (conn=%d): %v", connID, err)
+		if err := tun.WriteFrame(NewDataFrame(id, port, enc)); err != nil {
 			return
 		}
 	}
 }
 
-// ─── Maintain Reverse Tunnel to Foreign Server ───────────
+// ─── Tunnel ──────────────────────────────────────────────
 
-func (c *Client) maintainTunnel(ctx context.Context, remoteAddr string, tunnelID int) {
+func (c *Client) maintainTunnel(ctx context.Context, remote string, tid int) {
 	defer c.wg.Done()
 
 	backoff := time.Second
-	maxBackoff := 30 * time.Second
 
 	for {
 		select {
@@ -250,108 +216,109 @@ func (c *Client) maintainTunnel(ctx context.Context, remoteAddr string, tunnelID
 		default:
 		}
 
-		conn, err := c.dialTunnel(remoteAddr)
+		conn, err := c.dial(remote)
 		if err != nil {
-			log.Printf("[CLIENT] Tunnel#%d connect failed: %v (retry in %v)", tunnelID, err, backoff)
+			log.Printf("[CLIENT] T#%d connect: %v (retry %v)", tid, err, backoff)
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(backoff):
 			}
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+			if backoff < 30*time.Second {
+				backoff *= 2
 			}
 			continue
 		}
 
 		backoff = time.Second
-		log.Printf("[CLIENT] Tunnel#%d connected to %s", tunnelID, remoteAddr)
+		log.Printf("[CLIENT] T#%d connected to %s", tid, remote)
 
 		mux := NewMux(conn)
-
-		if err := c.authenticate(mux); err != nil {
-			log.Printf("[CLIENT] Tunnel#%d auth failed: %v", tunnelID, err)
+		if err := c.doAuth(mux); err != nil {
+			log.Printf("[CLIENT] T#%d auth: %v", tid, err)
 			mux.Close()
 			continue
 		}
-
-		log.Printf("[CLIENT] Tunnel#%d authenticated", tunnelID)
+		log.Printf("[CLIENT] T#%d authenticated", tid)
 
 		c.tunnelPool.Add(mux)
-		c.handleTunnel(ctx, mux, tunnelID)
+		c.readTunnel(ctx, mux, tid)
 		c.tunnelPool.Remove(mux)
 		mux.Close()
 
-		log.Printf("[CLIENT] Tunnel#%d lost, reconnecting...", tunnelID)
+		log.Printf("[CLIENT] T#%d lost, reconnecting...", tid)
 	}
 }
 
-func (c *Client) dialTunnel(address string) (net.Conn, error) {
+func (c *Client) dial(addr string) (net.Conn, error) {
 	switch c.cfg.Tunnel.Protocol {
 	case "tcp":
-		return NewTCPTransport(c.cfg.Performance.Timeout, c.cfg.Performance.NoDelay).Dial(address)
+		return NewTCPTransport(c.cfg.Performance.Timeout, c.cfg.Performance.NoDelay).Dial(addr)
 	case "kcp":
-		return NewKCPTransport(c.cfg.KCP).Dial(address)
-	default:
-		return nil, fmt.Errorf("unsupported protocol: %s", c.cfg.Tunnel.Protocol)
+		return NewKCPTransport(c.cfg.KCP).Dial(addr)
 	}
+	return nil, fmt.Errorf("bad protocol: %s", c.cfg.Tunnel.Protocol)
 }
 
-// ─── Authentication ──────────────────────────────────────
-
-func (c *Client) authenticate(mux *Mux) error {
+func (c *Client) doAuth(mux *Mux) error {
 	mux.conn.SetDeadline(time.Now().Add(time.Duration(c.cfg.Performance.Timeout) * time.Second))
 	defer mux.conn.SetDeadline(time.Time{})
 
-	token := GenerateAuthToken(c.cfg.Tunnel.SecretKey)
-	encToken, err := c.crypto.Encrypt(token)
+	enc, err := c.crypto.Encrypt(GenerateAuthToken(c.cfg.Tunnel.SecretKey))
 	if err != nil {
-		return fmt.Errorf("encrypt auth token: %w", err)
+		return err
+	}
+	if err := mux.WriteFrame(&Frame{Type: MsgAuth, Payload: enc}); err != nil {
+		return err
 	}
 
-	if err := mux.WriteFrame(&Frame{Type: MsgAuth, Payload: encToken}); err != nil {
-		return fmt.Errorf("send auth: %w", err)
-	}
-
-	frame, err := mux.ReadFrame()
+	f, err := mux.ReadFrame()
 	if err != nil {
-		return fmt.Errorf("read auth response: %w", err)
+		return err
+	}
+	if f.Type == MsgAuthFail {
+		return fmt.Errorf("rejected")
+	}
+	if f.Type != MsgAuthOK {
+		return fmt.Errorf("unexpected: 0x%02x", f.Type)
 	}
 
-	switch frame.Type {
-	case MsgAuthFail:
-		return fmt.Errorf("server rejected authentication")
-	case MsgAuthOK:
-	default:
-		return fmt.Errorf("unexpected response: 0x%02x", frame.Type)
-	}
-
-	portFrame, err := mux.ReadFrame()
+	// Read port map
+	pf, err := mux.ReadFrame()
 	if err != nil {
-		return fmt.Errorf("read port map: %w", err)
+		return err
 	}
-
-	if portFrame.Type == MsgPortMap && len(portFrame.Payload) > 0 {
-		if decPorts, err := c.crypto.Decrypt(portFrame.Payload); err == nil {
-			if ports, err := DecodePortMap(decPorts); err == nil {
+	if pf.Type == MsgPortMap && len(pf.Payload) > 0 {
+		if dec, err := c.crypto.Decrypt(pf.Payload); err == nil {
+			if ports, err := DecodePortMap(dec); err == nil {
 				log.Printf("[CLIENT] Server ports: %v", ports)
 			}
 		}
 	}
-
 	return nil
 }
 
-// ─── Handle Tunnel Frames (responses from server) ────────
-
-func (c *Client) handleTunnel(ctx context.Context, mux *Mux, tunnelID int) {
-	// Keepalive
+// readTunnel: read responses from server
+func (c *Client) readTunnel(ctx context.Context, mux *Mux, tid int) {
 	keepCtx, keepCancel := context.WithCancel(ctx)
 	defer keepCancel()
 
 	c.wg.Add(1)
-	go c.sendKeepalive(keepCtx, mux, tunnelID)
+	go func() {
+		defer c.wg.Done()
+		tk := time.NewTicker(time.Duration(c.cfg.Performance.Keepalive) * time.Second)
+		defer tk.Stop()
+		for {
+			select {
+			case <-keepCtx.Done():
+				return
+			case <-tk.C:
+				if mux.WriteFrame(NewControlFrame(MsgKeepAlive, 0, 0)) != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -360,26 +327,23 @@ func (c *Client) handleTunnel(ctx context.Context, mux *Mux, tunnelID int) {
 		default:
 		}
 
-		frame, err := mux.ReadFrame()
+		f, err := mux.ReadFrame()
 		if err != nil {
-			if err != io.EOF && !isClosedError(err) {
-				log.Printf("[CLIENT] Tunnel#%d read error: %v", tunnelID, err)
+			if err != io.EOF && !errClosed(err) {
+				log.Printf("[CLIENT] T#%d read: %v", tid, err)
 			}
 			return
 		}
 
-		switch frame.Type {
+		switch f.Type {
 		case MsgData:
-			// Response data from server (Xray response), forward to user
-			c.handleDataFromServer(frame)
+			// Response from Xray → forward to user
+			c.forwardToUser(f)
 
 		case MsgCloseConn:
-			// Server closed connection to local service
-			if v, ok := c.localConns.Load(frame.ConnID); ok {
-				if lc, ok := v.(net.Conn); ok {
-					lc.Close()
-				}
-				c.localConns.Delete(frame.ConnID)
+			if v, ok := c.localConns.Load(f.ConnID); ok {
+				v.(net.Conn).Close()
+				c.localConns.Delete(f.ConnID)
 			}
 
 		case MsgKeepAlive:
@@ -388,53 +352,25 @@ func (c *Client) handleTunnel(ctx context.Context, mux *Mux, tunnelID int) {
 	}
 }
 
-func (c *Client) sendKeepalive(ctx context.Context, mux *Mux, tunnelID int) {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(time.Duration(c.cfg.Performance.Keepalive) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := mux.WriteFrame(NewControlFrame(MsgKeepAlive, 0, 0)); err != nil {
-				log.Printf("[CLIENT] Tunnel#%d keepalive error: %v", tunnelID, err)
-				return
-			}
-		}
-	}
-}
-
-// Handle: server response → decrypt → forward to user
-func (c *Client) handleDataFromServer(frame *Frame) {
-	decrypted, err := c.crypto.Decrypt(frame.Payload)
+// forwardToUser: decrypt server response and send to user
+func (c *Client) forwardToUser(f *Frame) {
+	dec, err := c.crypto.Decrypt(f.Payload)
 	if err != nil {
-		log.Printf("[CLIENT] Decrypt error (conn=%d): %v", frame.ConnID, err)
 		return
 	}
-
-	data, err := c.obfs.Deobfuscate(decrypted)
+	data, err := c.obfs.Deobfuscate(dec)
 	if err != nil {
-		log.Printf("[CLIENT] Deobfuscate error (conn=%d): %v", frame.ConnID, err)
 		return
 	}
-
-	// Forward to user connection
-	v, ok := c.localConns.Load(frame.ConnID)
+	v, ok := c.localConns.Load(f.ConnID)
 	if !ok {
 		return
 	}
-	userConn, ok := v.(net.Conn)
-	if !ok {
-		return
+	user := v.(net.Conn)
+	user.SetWriteDeadline(time.Now().Add(time.Duration(c.cfg.Performance.Timeout) * time.Second))
+	if _, err := user.Write(data); err != nil {
+		user.Close()
+		c.localConns.Delete(f.ConnID)
 	}
-
-	userConn.SetWriteDeadline(time.Now().Add(time.Duration(c.cfg.Performance.Timeout) * time.Second))
-	if _, err := userConn.Write(data); err != nil {
-		userConn.Close()
-		c.localConns.Delete(frame.ConnID)
-	}
-	userConn.SetWriteDeadline(time.Time{})
+	user.SetWriteDeadline(time.Time{})
 }
