@@ -12,32 +12,20 @@ type BufferPool struct {
 
 func NewBufferPool(size int) *BufferPool {
 	bp := &BufferPool{size: size}
-	bp.pool = sync.Pool{
-		New: func() interface{} {
-			return make([]byte, bp.size)
-		},
-	}
+	bp.pool = sync.Pool{New: func() interface{} { return make([]byte, bp.size) }}
 	return bp
 }
 
-func (bp *BufferPool) Get() []byte {
-	return bp.pool.Get().([]byte)
-}
-
+func (bp *BufferPool) Get() []byte  { return bp.pool.Get().([]byte) }
 func (bp *BufferPool) Put(buf []byte) {
 	if cap(buf) == bp.size {
 		bp.pool.Put(buf[:bp.size])
 	}
 }
 
-type ConnIDGenerator struct {
-	counter uint32
-}
+type ConnIDGenerator struct{ counter uint32 }
 
-func NewConnIDGenerator() *ConnIDGenerator {
-	return &ConnIDGenerator{}
-}
-
+func NewConnIDGenerator() *ConnIDGenerator { return &ConnIDGenerator{} }
 func (g *ConnIDGenerator) Next() uint32 {
 	for {
 		id := atomic.AddUint32(&g.counter, 1)
@@ -52,9 +40,7 @@ type ConnMap struct {
 	items map[uint32]interface{}
 }
 
-func NewConnMap() *ConnMap {
-	return &ConnMap{items: make(map[uint32]interface{})}
-}
+func NewConnMap() *ConnMap { return &ConnMap{items: make(map[uint32]interface{})} }
 
 func (cm *ConnMap) Store(id uint32, v interface{}) {
 	cm.mu.Lock()
@@ -75,21 +61,14 @@ func (cm *ConnMap) Delete(id uint32) {
 	cm.mu.Unlock()
 }
 
-func (cm *ConnMap) Len() int {
-	cm.mu.RLock()
-	n := len(cm.items)
-	cm.mu.RUnlock()
-	return n
-}
-
 func (cm *ConnMap) Range(fn func(uint32, interface{}) bool) {
 	cm.mu.RLock()
+	defer cm.mu.RUnlock()
 	for id, v := range cm.items {
 		if !fn(id, v) {
 			break
 		}
 	}
-	cm.mu.RUnlock()
 }
 
 func (cm *ConnMap) Clear() {
