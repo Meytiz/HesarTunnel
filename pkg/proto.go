@@ -4,26 +4,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"sync"
 )
-
-/*
-Wire Protocol v2:
-
-Each frame on the wire:
-  [MagicByte:1][Version:1][Type:1][Flags:1][ConnID:4][Port:2][Length:2][Payload:N]
-
-Total header: 12 bytes
-MaxPayload: 65000 bytes (leaving room for encryption overhead)
-
-MagicByte prevents accidental parsing of garbage data.
-*/
 
 const (
 	ProtoMagic   byte = 0xAE
 	ProtoVersion byte = 0x02
 
-	// Message types
 	MsgData      byte = 0x01
 	MsgKeepAlive byte = 0x02
 	MsgNewConn   byte = 0x03
@@ -33,16 +19,12 @@ const (
 	MsgAuthFail  byte = 0x07
 	MsgPortMap   byte = 0x08
 
-	// Flags
-	FlagNone       byte = 0x00
-	FlagCompressed byte = 0x01
-	FlagUrgent     byte = 0x02
+	FlagNone byte = 0x00
 
 	HeaderSize = 12
 	MaxPayload = 65000
 )
 
-// Frame represents a protocol message
 type Frame struct {
 	Type    byte
 	Flags   byte
@@ -51,138 +33,94 @@ type Frame struct {
 	Payload []byte
 }
 
-// headerPool avoids allocating header buffers for every frame
-var headerPool = sync.Pool{
-	New: func() interface{} {
-		b := make([]byte, HeaderSize)
-		return &b
-	},
-}
-
-// MarshalFrame writes a frame directly to writer (thread-safe when writer is locked externally)
 func MarshalFrame(w io.Writer, f *Frame) error {
-	payloadLen := len(f.Payload)
-	if payloadLen > MaxPayload {
-		return fmt.Errorf("payload too large: %d > %d", payloadLen, MaxPayload)
+	pLen := len(f.Payload)
+	if pLen > MaxPayload {
+		return fmt.Errorf("payload too large: %d", pLen)
 	}
 
-	hdrPtr := headerPool.Get().(*[]byte)
-	hdr := *hdrPtr
-	defer headerPool.Put(hdrPtr)
-
+	hdr := make([]byte, HeaderSize)
 	hdr[0] = ProtoMagic
 	hdr[1] = ProtoVersion
 	hdr[2] = f.Type
 	hdr[3] = f.Flags
 	binary.BigEndian.PutUint32(hdr[4:8], f.ConnID)
 	binary.BigEndian.PutUint16(hdr[8:10], f.Port)
-	binary.BigEndian.PutUint16(hdr[10:12], uint16(payloadLen))
+	binary.BigEndian.PutUint16(hdr[10:12], uint16(pLen))
 
-	// Write header
 	if _, err := w.Write(hdr); err != nil {
 		return fmt.Errorf("write header: %w", err)
 	}
-
-	// Write payload
-	if payloadLen > 0 {
+	if pLen > 0 {
 		if _, err := w.Write(f.Payload); err != nil {
 			return fmt.Errorf("write payload: %w", err)
 		}
 	}
-
 	return nil
 }
 
-// UnmarshalFrame reads a frame from reader
 func UnmarshalFrame(r io.Reader) (*Frame, error) {
-	hdrPtr := headerPool.Get().(*[]byte)
-	hdr := *hdrPtr
-	defer headerPool.Put(hdrPtr)
-
+	hdr := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, hdr); err != nil {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
 
-	// Validate magic byte
 	if hdr[0] != ProtoMagic {
-		return nil, fmt.Errorf("invalid magic byte: 0x%02x (expected 0x%02x)", hdr[0], ProtoMagic)
+		return nil, fmt.Errorf("bad magic: 0x%02x", hdr[0])
 	}
-
-	// Validate version
 	if hdr[1] != ProtoVersion {
-		return nil, fmt.Errorf("unsupported protocol version: %d (expected %d)", hdr[1], ProtoVersion)
+		return nil, fmt.Errorf("bad version: %d", hdr[1])
 	}
 
-	msgType := hdr[2]
-	flags := hdr[3]
-	connID := binary.BigEndian.Uint32(hdr[4:8])
-	port := binary.BigEndian.Uint16(hdr[8:10])
-	payloadLen := binary.BigEndian.Uint16(hdr[10:12])
-
-	if payloadLen > MaxPayload {
-		return nil, fmt.Errorf("payload length too large: %d", payloadLen)
+	pLen := binary.BigEndian.Uint16(hdr[10:12])
+	if pLen > MaxPayload {
+		return nil, fmt.Errorf("payload too large: %d", pLen)
 	}
 
 	var payload []byte
-	if payloadLen > 0 {
-		payload = make([]byte, payloadLen)
+	if pLen > 0 {
+		payload = make([]byte, pLen)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, fmt.Errorf("read payload (%d bytes): %w", payloadLen, err)
+			return nil, fmt.Errorf("read payload: %w", err)
 		}
 	}
 
 	return &Frame{
-		Type:    msgType,
-		Flags:   flags,
-		ConnID:  connID,
-		Port:    port,
+		Type:    hdr[2],
+		Flags:   hdr[3],
+		ConnID:  binary.BigEndian.Uint32(hdr[4:8]),
+		Port:    binary.BigEndian.Uint16(hdr[8:10]),
 		Payload: payload,
 	}, nil
 }
 
-// NewDataFrame creates a data frame
 func NewDataFrame(connID uint32, port uint16, data []byte) *Frame {
-	return &Frame{
-		Type:    MsgData,
-		Flags:   FlagNone,
-		ConnID:  connID,
-		Port:    port,
-		Payload: data,
-	}
+	return &Frame{Type: MsgData, ConnID: connID, Port: port, Payload: data}
 }
 
-// NewControlFrame creates a control frame (no payload)
 func NewControlFrame(msgType byte, connID uint32, port uint16) *Frame {
-	return &Frame{
-		Type:   msgType,
-		Flags:  FlagNone,
-		ConnID: connID,
-		Port:   port,
-	}
+	return &Frame{Type: msgType, ConnID: connID, Port: port}
 }
 
-// EncodePortMap serializes a list of ports
 func EncodePortMap(ports []int) []byte {
 	buf := make([]byte, 2+len(ports)*2)
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(ports)))
-	for i, port := range ports {
-		binary.BigEndian.PutUint16(buf[2+i*2:4+i*2], uint16(port))
+	for i, p := range ports {
+		binary.BigEndian.PutUint16(buf[2+i*2:4+i*2], uint16(p))
 	}
 	return buf
 }
 
-// DecodePortMap deserializes a list of ports
 func DecodePortMap(data []byte) ([]int, error) {
 	if len(data) < 2 {
-		return nil, fmt.Errorf("port map data too short: %d bytes", len(data))
+		return nil, fmt.Errorf("port map too short")
 	}
-	count := int(binary.BigEndian.Uint16(data[0:2]))
-	expected := 2 + count*2
-	if len(data) < expected {
-		return nil, fmt.Errorf("port map data incomplete: need %d bytes, got %d", expected, len(data))
+	n := int(binary.BigEndian.Uint16(data[0:2]))
+	if len(data) < 2+n*2 {
+		return nil, fmt.Errorf("port map incomplete")
 	}
-	ports := make([]int, count)
-	for i := 0; i < count; i++ {
+	ports := make([]int, n)
+	for i := 0; i < n; i++ {
 		ports[i] = int(binary.BigEndian.Uint16(data[2+i*2 : 4+i*2]))
 	}
 	return ports, nil
