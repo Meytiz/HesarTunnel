@@ -9,7 +9,6 @@ import (
 const (
 	ProtoMagic   byte = 0xAE
 	ProtoVersion byte = 0x02
-
 	MsgData      byte = 0x01
 	MsgKeepAlive byte = 0x02
 	MsgNewConn   byte = 0x03
@@ -18,11 +17,8 @@ const (
 	MsgAuthOK    byte = 0x06
 	MsgAuthFail  byte = 0x07
 	MsgPortMap   byte = 0x08
-
-	FlagNone byte = 0x00
-
-	HeaderSize = 12
-	MaxPayload = 65000
+	HeaderSize        = 12
+	MaxPayload        = 65000
 )
 
 type Frame struct {
@@ -38,7 +34,6 @@ func MarshalFrame(w io.Writer, f *Frame) error {
 	if pLen > MaxPayload {
 		return fmt.Errorf("payload too large: %d", pLen)
 	}
-
 	hdr := make([]byte, HeaderSize)
 	hdr[0] = ProtoMagic
 	hdr[1] = ProtoVersion
@@ -47,13 +42,12 @@ func MarshalFrame(w io.Writer, f *Frame) error {
 	binary.BigEndian.PutUint32(hdr[4:8], f.ConnID)
 	binary.BigEndian.PutUint16(hdr[8:10], f.Port)
 	binary.BigEndian.PutUint16(hdr[10:12], uint16(pLen))
-
 	if _, err := w.Write(hdr); err != nil {
-		return fmt.Errorf("write header: %w", err)
+		return err
 	}
 	if pLen > 0 {
 		if _, err := w.Write(f.Payload); err != nil {
-			return fmt.Errorf("write payload: %w", err)
+			return err
 		}
 	}
 	return nil
@@ -62,29 +56,25 @@ func MarshalFrame(w io.Writer, f *Frame) error {
 func UnmarshalFrame(r io.Reader) (*Frame, error) {
 	hdr := make([]byte, HeaderSize)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return nil, fmt.Errorf("read header: %w", err)
+		return nil, err
 	}
-
 	if hdr[0] != ProtoMagic {
 		return nil, fmt.Errorf("bad magic: 0x%02x", hdr[0])
 	}
 	if hdr[1] != ProtoVersion {
 		return nil, fmt.Errorf("bad version: %d", hdr[1])
 	}
-
 	pLen := binary.BigEndian.Uint16(hdr[10:12])
 	if pLen > MaxPayload {
 		return nil, fmt.Errorf("payload too large: %d", pLen)
 	}
-
 	var payload []byte
 	if pLen > 0 {
 		payload = make([]byte, pLen)
 		if _, err := io.ReadFull(r, payload); err != nil {
-			return nil, fmt.Errorf("read payload: %w", err)
+			return nil, err
 		}
 	}
-
 	return &Frame{
 		Type:    hdr[2],
 		Flags:   hdr[3],
@@ -113,11 +103,11 @@ func EncodePortMap(ports []int) []byte {
 
 func DecodePortMap(data []byte) ([]int, error) {
 	if len(data) < 2 {
-		return nil, fmt.Errorf("port map too short")
+		return nil, fmt.Errorf("too short")
 	}
 	n := int(binary.BigEndian.Uint16(data[0:2]))
 	if len(data) < 2+n*2 {
-		return nil, fmt.Errorf("port map incomplete")
+		return nil, fmt.Errorf("incomplete")
 	}
 	ports := make([]int, n)
 	for i := 0; i < n; i++ {
