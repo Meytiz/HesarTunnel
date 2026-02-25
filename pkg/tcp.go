@@ -12,10 +12,7 @@ type TCPTransport struct {
 }
 
 func NewTCPTransport(timeout int, noDelay bool) *TCPTransport {
-	return &TCPTransport{
-		noDelay: noDelay,
-		timeout: time.Duration(timeout) * time.Second,
-	}
+	return &TCPTransport{noDelay: noDelay, timeout: time.Duration(timeout) * time.Second}
 }
 
 func (t *TCPTransport) Listen(addr string) (net.Listener, error) {
