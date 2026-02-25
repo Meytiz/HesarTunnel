@@ -324,21 +324,13 @@ write_config() {
     local remote_ip="$3"
     local config_ports="$4"
     local secret_key="$5"
-    local mode="$6"    # "client" or "server"
+    local mode="${6:-client}"   # ← اگر نبود، پیش‌فرض client
 
     mkdir -p "$CONFIG_DIR"
 
-    # تنظیم خودکار bind/forward بر اساس mode
+    # تنظیم خودکار بر اساس mode
     local server_bind="127.0.0.1"
     local client_forward="0.0.0.0"
-
-    if [[ "$mode" == "server" ]]; then
-        server_bind="127.0.0.1"     # Forward to Xray on localhost
-        client_forward="0.0.0.0"    # Not used on server
-    else
-        server_bind="127.0.0.1"     # Not used on client
-        client_forward="0.0.0.0"    # Listen for users from everywhere
-    fi
 
     cat > "$CONFIG_FILE" << EOF
 [tunnel]
