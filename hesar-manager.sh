@@ -18,7 +18,7 @@ readonly CONFIG_DIR="/etc/hesar-tunnel"
 readonly CONFIG_FILE="${CONFIG_DIR}/config.toml"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly LOG_FILE="/var/log/hesar-tunnel.log"
-readonly VERSION="1.2.0"
+readonly HESAR_VERSION="1.2.0"
 
 # ─── Colors ───────────────────────────────────────────────
 readonly RED='\033[0;31m'
@@ -61,11 +61,11 @@ detect_arch() {
     esac
 }
 
+# ─── اصلاح اصلی: خواندن os-release بدون تداخل ───────────
 detect_os() {
     if [[ -f /etc/os-release ]]; then
-        # shellcheck source=/dev/null
-        . /etc/os-release
-        OS="${ID}"
+        # از subshell و grep استفاده می‌کنیم تا readonly تداخل نکند
+        OS=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"' | head -1)
     elif [[ -f /etc/centos-release ]]; then
         OS="centos"
     else
@@ -77,7 +77,7 @@ install_deps() {
     step "Checking dependencies..."
     local missing=()
 
-    for cmd in curl wget tar; do
+    for cmd in curl wget tar git; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
@@ -94,7 +94,7 @@ install_deps() {
                 yum install -y -q "${missing[@]}" &>/dev/null
                 ;;
             *)
-                warn "Cannot auto-install dependencies. Please install: ${missing[*]}"
+                warn "Cannot auto-install. Please install: ${missing[*]}"
                 ;;
         esac
     fi
@@ -115,14 +115,6 @@ is_enabled() {
     systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null
 }
 
-get_service_mode() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        grep -oP '(?<=ExecStart=.*--mode )\w+' "$SERVICE_FILE" 2>/dev/null || echo "unknown"
-    else
-        echo "not configured"
-    fi
-}
-
 # ─── Banner ───────────────────────────────────────────────
 
 print_banner() {
@@ -141,11 +133,11 @@ print_banner() {
     ╚═══════════════════════════════════════════════════╝
 BANNER
     echo -e "${NC}"
-    echo -e "    ${WHITE}HesarTunnel Manager v${VERSION}${NC}"
+    echo -e "    ${WHITE}HesarTunnel Manager v${HESAR_VERSION}${NC}"
     echo -e "    ${CYAN}github.com/${GITHUB_USER}/${GITHUB_REPO}${NC}"
     echo ""
 
-    # Quick status line
+    # Quick status
     if is_running; then
         local pid
         pid=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || echo "?")
@@ -207,9 +199,6 @@ net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_no_metrics_save = 1
 
-# Conntrack
-net.netfilter.nf_conntrack_max = 2097152
-
 # File limits
 fs.file-max = 1048576
 fs.nr_open = 1048576
@@ -221,6 +210,9 @@ net.core.optmem_max = 65535
 EOF
 
     sysctl -p /etc/sysctl.d/99-hesar-tunnel.conf &>/dev/null || true
+
+    # conntrack - optional, may not be loaded
+    sysctl -w net.netfilter.nf_conntrack_max=2097152 &>/dev/null || true
 
     # Increase ulimits
     cat > /etc/security/limits.d/99-hesar-tunnel.conf << 'EOF'
@@ -277,7 +269,7 @@ build_from_source() {
         rm -rf /usr/local/go
         tar -C /usr/local -xzf /tmp/go.tar.gz
         rm -f /tmp/go.tar.gz
-        export PATH=$PATH:/usr/local/go/bin
+        export PATH="$PATH:/usr/local/go/bin"
         info "Go ${go_ver} installed"
     fi
 
@@ -286,9 +278,9 @@ build_from_source() {
 
     if git clone --depth=1 "https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git" "$build_dir" 2>/dev/null; then
         cd "$build_dir"
-        export PATH=$PATH:/usr/local/go/bin
+        export PATH="$PATH:/usr/local/go/bin"
         go mod tidy 2>/dev/null || true
-        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" -o "${BINARY_NAME}" main.go
+        CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${HESAR_VERSION}" -o "${BINARY_NAME}" main.go
         mv "${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
         chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
         cd /
@@ -308,7 +300,7 @@ create_service() {
 
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=HesarTunnel ${mode^} 
+Description=HesarTunnel ${mode}
 After=network.target network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -578,7 +570,7 @@ show_status() {
         local pid mem cpu conns
         pid=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || echo "?")
         mem=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{printf "%.1f MB", $1/1024}' || echo "N/A")
-        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null || echo "N/A")
+        cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | awk '{print $1}' || echo "N/A")
         conns=$(ss -tnp 2>/dev/null | grep -c "pid=${pid}," || echo "0")
 
         echo -e "    State:       ${GREEN}● Active${NC}"
