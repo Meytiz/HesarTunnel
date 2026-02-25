@@ -1,36 +1,24 @@
-# ═══════════════════════════════════════════════════════════
-# HesarTunnel Configuration
-# https://github.com/Meytiz/HesarTunnel
-# ═══════════════════════════════════════════════════════════
-
 [tunnel]
-# Transport protocol: "tcp" or "kcp"
 protocol = "tcp"
-
-# Port for tunnel connection between Iran and Foreign server
 tunnel_port = 4000
-
-# Remote server IP (client mode: foreign server IP, server mode: "0.0.0.0")
 remote_ip = "0.0.0.0"
+config_ports = "8880"
+secret_key = "your-secret-key"
 
-# Ports to tunnel. Formats: "80", "80,443", "80-100", "80,443,8000-8010"
-config_ports = "80,443"
+# سرور خارج: آدرس forward به سرویس محلی (Xray)
+# معمولاً 127.0.0.1 چون Xray روی همان سرور است
+server_bind = "127.0.0.1"
 
-# Shared secret key (MUST be identical on both servers)
-secret_key = "change-this-to-a-strong-key"
+# سرور ایران: آدرس listen برای کاربران  
+# 0.0.0.0 = از همه جا قبول کن
+client_forward = "0.0.0.0"
 
 [crypto]
-# Encryption: "chacha20-poly1305" (recommended) or "aes-256-gcm"
 method = "chacha20-poly1305"
-
-# Traffic obfuscation to bypass DPI
 obfuscation = true
-
-# Obfuscation mode: "tls-hello", "http", "random-padding"
 obfs_mode = "tls-hello"
 
 [kcp]
-# KCP settings (only used when protocol = "kcp")
 preset = "fast2"
 data_shard = 10
 parity_shard = 3
@@ -40,20 +28,9 @@ mtu = 1350
 dscp = 46
 
 [performance]
-# Number of simultaneous tunnel connections
 tunnel_count = 4
-
-# Read buffer size (bytes)
 buffer_size = 32768
-
-# Connection timeout (seconds)
 timeout = 30
-
-# Keepalive interval (seconds)
 keepalive = 10
-
-# TCP_NODELAY
 no_delay = true
-
-# Max idle time before connection is closed (seconds)
 max_idle = 300
