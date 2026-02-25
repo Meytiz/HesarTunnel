@@ -10,27 +10,26 @@ import (
 	"time"
 )
 
-// Server runs on the foreign/remote server
-// Accepts reverse tunnel connections from Iran client
-// Listens on config ports and forwards traffic through tunnel
+// Server runs on FOREIGN server
+// - Listens for reverse tunnel connections from Iran client
+// - When data arrives through tunnel, forwards to LOCAL services (e.g., Xray on 127.0.0.1)
+// - Does NOT listen on config ports (client does that)
 type Server struct {
 	cfg    *Config
 	crypto *CryptoEngine
 	obfs   *Obfuscator
 	pool   *BufferPool
-	idGen  *ConnIDGenerator
 	ports  []int
 
 	tunnelPool *TunnelPool
-	localConns *ConnMap // connID -> net.Conn
+	localConns *ConnMap // connID -> net.Conn (connections to local services like Xray)
 
-	listeners []net.Listener
-	listMu    sync.Mutex
+	tunnelListener net.Listener
+	listMu         sync.Mutex
 
 	wg sync.WaitGroup
 }
 
-// NewServer creates a new server instance
 func NewServer(cfg *Config) (*Server, error) {
 	crypto, err := NewCryptoEngine(cfg.Crypto.Method, cfg.Tunnel.SecretKey)
 	if err != nil {
@@ -47,65 +46,43 @@ func NewServer(cfg *Config) (*Server, error) {
 		crypto:     crypto,
 		obfs:       NewObfuscator(cfg.Crypto.ObfsMode, cfg.Crypto.Obfuscation),
 		pool:       NewBufferPool(cfg.Performance.BufferSize),
-		idGen:      NewConnIDGenerator(),
 		ports:      ports,
 		tunnelPool: NewTunnelPool(),
 		localConns: NewConnMap(),
 	}, nil
 }
 
-// Run starts the server and blocks until context is cancelled
 func (s *Server) Run(ctx context.Context) error {
-	// Start tunnel listener
+	// Only ONE listener: the tunnel port
+	// Config ports are NOT listened here — client (Iran) does that
 	tunnelAddr := fmt.Sprintf("0.0.0.0:%d", s.cfg.Tunnel.TunnelPort)
 	log.Printf("[SERVER] Starting tunnel listener on %s (protocol: %s)", tunnelAddr, s.cfg.Tunnel.Protocol)
+	log.Printf("[SERVER] Forward target: %s (config ports: %v)", s.cfg.Tunnel.ServerBind, s.ports)
+	log.Printf("[SERVER] Waiting for client connections from Iran...")
 
-	tunnelListener, err := s.createListener(tunnelAddr)
+	var err error
+	s.tunnelListener, err = s.createListener(tunnelAddr)
 	if err != nil {
 		return fmt.Errorf("tunnel listener: %w", err)
 	}
-	s.addListener(tunnelListener)
 
-	// Accept tunnel connections
+	// Accept tunnel connections from Iran
 	s.wg.Add(1)
-	go s.acceptTunnels(ctx, tunnelListener)
+	go s.acceptTunnels(ctx)
 
-	// Start config port listeners
-	for _, port := range s.ports {
-		addr := fmt.Sprintf("0.0.0.0:%d", port)
-		listener, err := net.Listen("tcp", addr)
-		if err != nil {
-			log.Printf("[SERVER] WARNING: Cannot listen on port %d: %v", port, err)
-			continue
-		}
-		s.addListener(listener)
-		log.Printf("[SERVER] Listening on config port %d", port)
-
-		s.wg.Add(1)
-		go s.acceptConfigConns(ctx, listener, port)
-	}
-
-	// Wait for context cancellation
 	<-ctx.Done()
 	return nil
 }
 
-// Shutdown performs graceful shutdown
 func (s *Server) Shutdown(ctx context.Context) {
 	log.Println("[SERVER] Shutting down...")
 
-	// Close all listeners first (stop accepting new connections)
-	s.listMu.Lock()
-	for _, l := range s.listeners {
-		l.Close()
+	if s.tunnelListener != nil {
+		s.tunnelListener.Close()
 	}
-	s.listeners = nil
-	s.listMu.Unlock()
 
-	// Close all tunnel connections
 	s.tunnelPool.CloseAll()
 
-	// Close all local connections
 	s.localConns.Range(func(id uint32, v interface{}) bool {
 		if conn, ok := v.(net.Conn); ok {
 			conn.Close()
@@ -114,7 +91,6 @@ func (s *Server) Shutdown(ctx context.Context) {
 	})
 	s.localConns.Clear()
 
-	// Wait for goroutines with timeout
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()
@@ -125,7 +101,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 	case <-done:
 		log.Println("[SERVER] All goroutines stopped")
 	case <-ctx.Done():
-		log.Println("[SERVER] Shutdown timeout, forcing exit")
+		log.Println("[SERVER] Shutdown timeout")
 	}
 }
 
@@ -140,12 +116,6 @@ func (s *Server) createListener(address string) (net.Listener, error) {
 	}
 }
 
-func (s *Server) addListener(l net.Listener) {
-	s.listMu.Lock()
-	s.listeners = append(s.listeners, l)
-	s.listMu.Unlock()
-}
-
 func (s *Server) optimizeConn(conn net.Conn) {
 	switch s.cfg.Tunnel.Protocol {
 	case "tcp":
@@ -155,13 +125,13 @@ func (s *Server) optimizeConn(conn net.Conn) {
 	}
 }
 
-// ─── Tunnel Connection Handling ──────────────────────────
+// ─── Accept Tunnel Connections from Iran ─────────────────
 
-func (s *Server) acceptTunnels(ctx context.Context, listener net.Listener) {
+func (s *Server) acceptTunnels(ctx context.Context) {
 	defer s.wg.Done()
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := s.tunnelListener.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -186,8 +156,9 @@ func (s *Server) acceptTunnels(ctx context.Context, listener net.Listener) {
 func (s *Server) handleTunnelConn(ctx context.Context, conn net.Conn) {
 	defer s.wg.Done()
 
-	// Authenticate
 	mux := NewMux(conn)
+
+	// Authenticate client
 	if err := s.authenticateClient(mux); err != nil {
 		log.Printf("[SERVER] Auth failed from %s: %v", conn.RemoteAddr(), err)
 		mux.Close()
@@ -196,7 +167,6 @@ func (s *Server) handleTunnelConn(ctx context.Context, conn net.Conn) {
 
 	log.Printf("[SERVER] Tunnel authenticated from %s", conn.RemoteAddr())
 
-	// Add to pool
 	s.tunnelPool.Add(mux)
 	defer func() {
 		s.tunnelPool.Remove(mux)
@@ -204,7 +174,11 @@ func (s *Server) handleTunnelConn(ctx context.Context, conn net.Conn) {
 		log.Printf("[SERVER] Tunnel disconnected: %s", conn.RemoteAddr())
 	}()
 
-	// Read frames from tunnel (responses from client)
+	// Read frames from tunnel
+	// In REVERSE tunnel:
+	// - MsgNewConn: client accepted a user, we need to connect to LOCAL service
+	// - MsgData: data from user (via client), forward to local service
+	// - MsgCloseConn: user disconnected
 	for {
 		select {
 		case <-ctx.Done():
@@ -221,10 +195,18 @@ func (s *Server) handleTunnelConn(ctx context.Context, conn net.Conn) {
 		}
 
 		switch frame.Type {
+		case MsgNewConn:
+			// Client (Iran) accepted a new user connection
+			// We need to connect to local service (e.g., Xray)
+			s.wg.Add(1)
+			go s.handleNewLocalConn(ctx, mux, frame.Port, frame.ConnID)
+
 		case MsgData:
+			// Data from user (through client), forward to local service
 			s.handleDataFromClient(frame)
 
 		case MsgCloseConn:
+			// User disconnected, close local connection
 			if v, ok := s.localConns.Load(frame.ConnID); ok {
 				if lc, ok := v.(net.Conn); ok {
 					lc.Close()
@@ -238,141 +220,67 @@ func (s *Server) handleTunnelConn(ctx context.Context, conn net.Conn) {
 	}
 }
 
+// ─── Authentication ──────────────────────────────────────
+
 func (s *Server) authenticateClient(mux *Mux) error {
-	// Set deadline for auth
 	mux.conn.SetDeadline(time.Now().Add(time.Duration(s.cfg.Performance.Timeout) * time.Second))
 	defer mux.conn.SetDeadline(time.Time{})
 
-	// Read auth frame
 	frame, err := mux.ReadFrame()
 	if err != nil {
 		return fmt.Errorf("read auth: %w", err)
 	}
 	if frame.Type != MsgAuth {
-		return fmt.Errorf("expected MsgAuth, got type 0x%02x", frame.Type)
+		return fmt.Errorf("expected MsgAuth, got 0x%02x", frame.Type)
 	}
 
-	// Decrypt and verify token
 	token, err := s.crypto.Decrypt(frame.Payload)
 	if err != nil {
-		return fmt.Errorf("decrypt auth token: %w", err)
+		return fmt.Errorf("decrypt token: %w", err)
 	}
 	if !VerifyAuthToken(token, s.cfg.Tunnel.SecretKey) {
 		mux.WriteFrame(NewControlFrame(MsgAuthFail, 0, 0))
 		return fmt.Errorf("invalid auth token")
 	}
 
-	// Send auth success
 	if err := mux.WriteFrame(NewControlFrame(MsgAuthOK, 0, 0)); err != nil {
 		return fmt.Errorf("send auth OK: %w", err)
 	}
 
-	// Send port mapping
 	portData := EncodePortMap(s.ports)
 	encPorts, err := s.crypto.Encrypt(portData)
 	if err != nil {
 		return fmt.Errorf("encrypt port map: %w", err)
 	}
-	if err := mux.WriteFrame(&Frame{Type: MsgPortMap, Payload: encPorts}); err != nil {
-		return fmt.Errorf("send port map: %w", err)
-	}
-
-	return nil
+	return mux.WriteFrame(&Frame{Type: MsgPortMap, Payload: encPorts})
 }
 
-func (s *Server) handleDataFromClient(frame *Frame) {
-	// Decrypt
-	decrypted, err := s.crypto.Decrypt(frame.Payload)
-	if err != nil {
-		log.Printf("[SERVER] Decrypt error (conn=%d): %v", frame.ConnID, err)
-		return
-	}
+// ─── Handle New Local Connection (connect to Xray etc.) ──
 
-	// Deobfuscate
-	data, err := s.obfs.Deobfuscate(decrypted)
-	if err != nil {
-		log.Printf("[SERVER] Deobfuscate error (conn=%d): %v", frame.ConnID, err)
-		return
-	}
-
-	// Forward to local connection
-	v, ok := s.localConns.Load(frame.ConnID)
-	if !ok {
-		return
-	}
-	lc, ok := v.(net.Conn)
-	if !ok {
-		return
-	}
-
-	lc.SetWriteDeadline(time.Now().Add(time.Duration(s.cfg.Performance.Timeout) * time.Second))
-	if _, err := lc.Write(data); err != nil {
-		lc.Close()
-		s.localConns.Delete(frame.ConnID)
-	}
-	lc.SetWriteDeadline(time.Time{})
-}
-
-// ─── Config Port Connection Handling ─────────────────────
-
-func (s *Server) acceptConfigConns(ctx context.Context, listener net.Listener, port int) {
+func (s *Server) handleNewLocalConn(ctx context.Context, mux *Mux, port uint16, connID uint32) {
 	defer s.wg.Done()
 
-	tcpTransport := NewTCPTransport(s.cfg.Performance.Timeout, s.cfg.Performance.NoDelay)
-
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				if isClosedError(err) {
-					return
-				}
-				log.Printf("[SERVER] Port %d accept error: %v", port, err)
-				time.Sleep(50 * time.Millisecond)
-				continue
-			}
-		}
-
-		tcpTransport.Optimize(conn)
-
-		// Get a tunnel
-		tunnel := s.tunnelPool.Get()
-		if tunnel == nil {
-			log.Printf("[SERVER] No tunnel available for port %d, rejecting connection", port)
-			conn.Close()
-			continue
-		}
-		s.tunnelPool.AdvanceIndex()
-
-		// Assign connection ID
-		connID := s.idGen.Next()
-		s.localConns.Store(connID, conn)
-
-		// Notify client about new connection
-		if err := tunnel.WriteFrame(NewControlFrame(MsgNewConn, connID, uint16(port))); err != nil {
-			log.Printf("[SERVER] Failed to notify client for conn %d: %v", connID, err)
-			conn.Close()
-			s.localConns.Delete(connID)
-			continue
-		}
-
-		// Forward local -> tunnel
-		s.wg.Add(1)
-		go s.forwardLocalToTunnel(ctx, conn, tunnel, uint16(port), connID)
+	// Connect to LOCAL service (e.g., Xray on 127.0.0.1:8880)
+	localAddr := fmt.Sprintf("%s:%d", s.cfg.Tunnel.ServerBind, port)
+	localConn, err := net.DialTimeout("tcp", localAddr, time.Duration(s.cfg.Performance.Timeout)*time.Second)
+	if err != nil {
+		log.Printf("[SERVER] Cannot connect to local %s (conn=%d): %v", localAddr, connID, err)
+		mux.WriteFrame(NewControlFrame(MsgCloseConn, connID, port))
+		return
 	}
-}
 
-func (s *Server) forwardLocalToTunnel(ctx context.Context, localConn net.Conn, tunnel *Mux, port uint16, connID uint32) {
-	defer s.wg.Done()
+	NewTCPTransport(s.cfg.Performance.Timeout, s.cfg.Performance.NoDelay).Optimize(localConn)
+	s.localConns.Store(connID, localConn)
+
+	log.Printf("[SERVER] Connected to local %s (conn=%d)", localAddr, connID)
+
 	defer func() {
-		tunnel.WriteFrame(NewControlFrame(MsgCloseConn, connID, port))
 		localConn.Close()
 		s.localConns.Delete(connID)
+		mux.WriteFrame(NewControlFrame(MsgCloseConn, connID, port))
 	}()
 
+	// Read from local service → encrypt → send through tunnel → client → user
 	buf := s.pool.Get()
 	defer s.pool.Put(buf)
 
@@ -398,26 +306,59 @@ func (s *Server) forwardLocalToTunnel(ctx context.Context, localConn net.Conn, t
 			continue
 		}
 
-		// Obfuscate
+		// Obfuscate + Encrypt
 		obfuscated, err := s.obfs.Obfuscate(buf[:n])
 		if err != nil {
 			log.Printf("[SERVER] Obfuscate error: %v", err)
 			return
 		}
 
-		// Encrypt
 		encrypted, err := s.crypto.Encrypt(obfuscated)
 		if err != nil {
 			log.Printf("[SERVER] Encrypt error: %v", err)
 			return
 		}
 
-		// Send through tunnel
-		if err := tunnel.WriteFrame(NewDataFrame(connID, port, encrypted)); err != nil {
+		// Send back through tunnel to client
+		if err := mux.WriteFrame(NewDataFrame(connID, port, encrypted)); err != nil {
 			log.Printf("[SERVER] Tunnel write error (conn=%d): %v", connID, err)
 			return
 		}
 	}
+}
+
+// ─── Handle Data from Client (user data) ─────────────────
+
+func (s *Server) handleDataFromClient(frame *Frame) {
+	// Decrypt data that came from user through tunnel
+	decrypted, err := s.crypto.Decrypt(frame.Payload)
+	if err != nil {
+		log.Printf("[SERVER] Decrypt error (conn=%d): %v", frame.ConnID, err)
+		return
+	}
+
+	data, err := s.obfs.Deobfuscate(decrypted)
+	if err != nil {
+		log.Printf("[SERVER] Deobfuscate error (conn=%d): %v", frame.ConnID, err)
+		return
+	}
+
+	// Forward to local service (Xray)
+	v, ok := s.localConns.Load(frame.ConnID)
+	if !ok {
+		return
+	}
+	lc, ok := v.(net.Conn)
+	if !ok {
+		return
+	}
+
+	lc.SetWriteDeadline(time.Now().Add(time.Duration(s.cfg.Performance.Timeout) * time.Second))
+	if _, err := lc.Write(data); err != nil {
+		lc.Close()
+		s.localConns.Delete(frame.ConnID)
+	}
+	lc.SetWriteDeadline(time.Time{})
 }
 
 // ─── Helpers ─────────────────────────────────────────────
@@ -433,26 +374,20 @@ func isClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
+	errStr := err.Error()
 	return err == io.EOF ||
 		err == io.ErrClosedPipe ||
 		err == net.ErrClosed ||
-		isErrorContains(err, "use of closed") ||
-		isErrorContains(err, "broken pipe") ||
-		isErrorContains(err, "connection reset")
+		containsStr(errStr, "use of closed") ||
+		containsStr(errStr, "broken pipe") ||
+		containsStr(errStr, "connection reset")
 }
 
-func isErrorContains(err error, substr string) bool {
-	if err == nil {
-		return false
-	}
-	return len(err.Error()) > 0 && contains(err.Error(), substr)
+func containsStr(s, substr string) bool {
+	return len(s) >= len(substr) && findStr(s, substr)
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchString(s, substr)
-}
-
-func searchString(s, substr string) bool {
+func findStr(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {
 			return true
