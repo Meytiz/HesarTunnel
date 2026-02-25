@@ -64,28 +64,26 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func setDefaults(cfg *Config) {
-	d := func(s *string, v string) {
+	ds := func(s *string, v string) {
 		if *s == "" {
 			*s = v
 		}
 	}
-	di := func(i *int, v, min, max int) {
-		if *i < min {
+	di := func(i *int, v, mn, mx int) {
+		if *i < mn {
 			*i = v
 		}
-		if *i > max {
-			*i = max
+		if *i > mx {
+			*i = mx
 		}
 	}
-
-	d(&cfg.Tunnel.Protocol, "tcp")
-	d(&cfg.Tunnel.RemoteIP, "0.0.0.0")
-	d(&cfg.Tunnel.ServerBind, "127.0.0.1")
-	d(&cfg.Tunnel.ClientForward, "0.0.0.0")
-	d(&cfg.Crypto.Method, "chacha20-poly1305")
-	d(&cfg.Crypto.ObfsMode, "tls-hello")
-	d(&cfg.KCP.Preset, "fast2")
-
+	ds(&cfg.Tunnel.Protocol, "tcp")
+	ds(&cfg.Tunnel.RemoteIP, "0.0.0.0")
+	ds(&cfg.Tunnel.ServerBind, "127.0.0.1")
+	ds(&cfg.Tunnel.ClientForward, "0.0.0.0")
+	ds(&cfg.Crypto.Method, "chacha20-poly1305")
+	ds(&cfg.Crypto.ObfsMode, "tls-hello")
+	ds(&cfg.KCP.Preset, "fast2")
 	di(&cfg.Tunnel.TunnelPort, 4000, 1, 65535)
 	di(&cfg.Performance.TunnelCount, 4, 1, 32)
 	di(&cfg.Performance.BufferSize, 32768, 4096, 1048576)
@@ -105,7 +103,6 @@ func validateConfig(cfg *Config) error {
 	default:
 		return fmt.Errorf("invalid protocol '%s'", cfg.Tunnel.Protocol)
 	}
-
 	if cfg.Tunnel.RemoteIP != "0.0.0.0" {
 		if net.ParseIP(cfg.Tunnel.RemoteIP) == nil {
 			if _, err := net.LookupHost(cfg.Tunnel.RemoteIP); err != nil {
@@ -119,7 +116,6 @@ func validateConfig(cfg *Config) error {
 	if net.ParseIP(cfg.Tunnel.ClientForward) == nil {
 		return fmt.Errorf("invalid client_forward '%s'", cfg.Tunnel.ClientForward)
 	}
-
 	if cfg.Tunnel.ConfigPorts == "" {
 		return fmt.Errorf("config_ports is empty")
 	}
@@ -128,19 +124,16 @@ func validateConfig(cfg *Config) error {
 		return fmt.Errorf("config_ports: %w", err)
 	}
 	if len(ports) > 500 {
-		return fmt.Errorf("too many ports (%d, max 500)", len(ports))
+		return fmt.Errorf("too many ports (%d)", len(ports))
 	}
-
 	if len(cfg.Tunnel.SecretKey) < 8 {
-		return fmt.Errorf("secret_key too short (min 8 chars)")
+		return fmt.Errorf("secret_key too short")
 	}
-
 	switch cfg.Crypto.Method {
 	case "chacha20-poly1305", "aes-256-gcm":
 	default:
 		return fmt.Errorf("invalid crypto method '%s'", cfg.Crypto.Method)
 	}
-
 	if cfg.Crypto.Obfuscation {
 		switch cfg.Crypto.ObfsMode {
 		case "tls-hello", "http", "random-padding":
@@ -148,13 +141,11 @@ func validateConfig(cfg *Config) error {
 			return fmt.Errorf("invalid obfs_mode '%s'", cfg.Crypto.ObfsMode)
 		}
 	}
-
 	switch cfg.KCP.Preset {
 	case "fast3", "fast2", "fast", "normal":
 	default:
 		return fmt.Errorf("invalid KCP preset '%s'", cfg.KCP.Preset)
 	}
-
 	return nil
 }
 
@@ -163,24 +154,21 @@ func ParsePorts(spec string) ([]int, error) {
 	if spec == "" {
 		return nil, fmt.Errorf("empty port specification")
 	}
-
 	var ports []int
 	seen := make(map[int]bool)
-
 	for _, part := range strings.Split(spec, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-
 		if idx := strings.IndexByte(part, '-'); idx >= 0 {
 			start, err := strconv.Atoi(strings.TrimSpace(part[:idx]))
 			if err != nil {
-				return nil, fmt.Errorf("invalid range start in '%s'", part)
+				return nil, fmt.Errorf("bad range start '%s'", part)
 			}
 			end, err := strconv.Atoi(strings.TrimSpace(part[idx+1:]))
 			if err != nil {
-				return nil, fmt.Errorf("invalid range end in '%s'", part)
+				return nil, fmt.Errorf("bad range end '%s'", part)
 			}
 			if err := checkPort(start); err != nil {
 				return nil, err
@@ -189,10 +177,7 @@ func ParsePorts(spec string) ([]int, error) {
 				return nil, err
 			}
 			if start > end {
-				return nil, fmt.Errorf("range start > end: %d > %d", start, end)
-			}
-			if end-start > 500 {
-				return nil, fmt.Errorf("range too large: %d-%d", start, end)
+				return nil, fmt.Errorf("start > end: %d > %d", start, end)
 			}
 			for p := start; p <= end; p++ {
 				if !seen[p] {
@@ -203,7 +188,7 @@ func ParsePorts(spec string) ([]int, error) {
 		} else {
 			p, err := strconv.Atoi(part)
 			if err != nil {
-				return nil, fmt.Errorf("invalid port '%s'", part)
+				return nil, fmt.Errorf("bad port '%s'", part)
 			}
 			if err := checkPort(p); err != nil {
 				return nil, err
@@ -214,7 +199,6 @@ func ParsePorts(spec string) ([]int, error) {
 			}
 		}
 	}
-
 	if len(ports) == 0 {
 		return nil, fmt.Errorf("no ports found")
 	}
@@ -223,7 +207,7 @@ func ParsePorts(spec string) ([]int, error) {
 
 func checkPort(p int) error {
 	if p < 1 || p > 65535 {
-		return fmt.Errorf("port %d out of range (1-65535)", p)
+		return fmt.Errorf("port %d out of range", p)
 	}
 	return nil
 }
