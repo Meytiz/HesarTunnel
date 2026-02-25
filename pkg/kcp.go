@@ -7,13 +7,9 @@ import (
 	kcp "github.com/xtaci/kcp-go/v5"
 )
 
-type KCPTransport struct {
-	cfg KCPConfig
-}
+type KCPTransport struct{ cfg KCPConfig }
 
-func NewKCPTransport(cfg KCPConfig) *KCPTransport {
-	return &KCPTransport{cfg: cfg}
-}
+func NewKCPTransport(cfg KCPConfig) *KCPTransport { return &KCPTransport{cfg: cfg} }
 
 func (k *KCPTransport) Listen(addr string) (net.Listener, error) {
 	ln, err := kcp.ListenWithOptions(addr, nil, k.cfg.DataShard, k.cfg.ParityShard)
