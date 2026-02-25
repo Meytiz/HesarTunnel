@@ -8,10 +8,10 @@ import (
 )
 
 type Mux struct {
-	conn    net.Conn
-	writeMu sync.Mutex
-	closed  chan struct{}
-	once    sync.Once
+	conn   net.Conn
+	wmu    sync.Mutex
+	closed chan struct{}
+	once   sync.Once
 }
 
 func NewMux(conn net.Conn) *Mux {
@@ -24,9 +24,9 @@ func (m *Mux) WriteFrame(f *Frame) error {
 		return io.ErrClosedPipe
 	default:
 	}
-	m.writeMu.Lock()
+	m.wmu.Lock()
 	err := MarshalFrame(m.conn, f)
-	m.writeMu.Unlock()
+	m.wmu.Unlock()
 	return err
 }
 
@@ -41,10 +41,7 @@ func (m *Mux) ReadFrame() (*Frame, error) {
 
 func (m *Mux) Close() error {
 	var err error
-	m.once.Do(func() {
-		close(m.closed)
-		err = m.conn.Close()
-	})
+	m.once.Do(func() { close(m.closed); err = m.conn.Close() })
 	return err
 }
 
@@ -72,9 +69,9 @@ func NewTunnelPool() *TunnelPool {
 func (tp *TunnelPool) Add(m *Mux) {
 	tp.mu.Lock()
 	tp.tunnels = append(tp.tunnels, m)
-	total := len(tp.tunnels)
+	n := len(tp.tunnels)
 	tp.mu.Unlock()
-	log.Printf("[POOL] Tunnel added from %s (total: %d)", m.RemoteAddr(), total)
+	log.Printf("[POOL] Added from %s (total: %d)", m.RemoteAddr(), n)
 }
 
 func (tp *TunnelPool) Remove(m *Mux) {
@@ -88,25 +85,22 @@ func (tp *TunnelPool) Remove(m *Mux) {
 	if tp.idx >= len(tp.tunnels) && len(tp.tunnels) > 0 {
 		tp.idx = 0
 	}
-	remaining := len(tp.tunnels)
+	n := len(tp.tunnels)
 	tp.mu.Unlock()
-	log.Printf("[POOL] Tunnel removed (remaining: %d)", remaining)
+	log.Printf("[POOL] Removed (remaining: %d)", n)
 }
 
 func (tp *TunnelPool) Get() *Mux {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
-
 	n := len(tp.tunnels)
 	if n == 0 {
 		return nil
 	}
-
-	// Try from current index, find first alive
 	for i := 0; i < n; i++ {
-		candidate := tp.tunnels[(tp.idx+i)%n]
-		if !candidate.IsClosed() {
-			return candidate
+		c := tp.tunnels[(tp.idx+i)%n]
+		if !c.IsClosed() {
+			return c
 		}
 	}
 	return nil
@@ -118,13 +112,6 @@ func (tp *TunnelPool) AdvanceIndex() {
 		tp.idx = (tp.idx + 1) % len(tp.tunnels)
 	}
 	tp.mu.Unlock()
-}
-
-func (tp *TunnelPool) Count() int {
-	tp.mu.Lock()
-	n := len(tp.tunnels)
-	tp.mu.Unlock()
-	return n
 }
 
 func (tp *TunnelPool) CloseAll() {
