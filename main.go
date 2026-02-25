@@ -15,52 +15,50 @@ import (
 )
 
 var (
-	Version   = "1.2.0"
+	Version   = "1.3.0"
 	BuildDate = "unknown"
 	GitCommit = "unknown"
 )
 
 func main() {
-	// Parse flags
 	configPath := flag.String("config", "/etc/hesar-tunnel/config.toml", "Path to configuration file")
 	showVersion := flag.Bool("version", false, "Show version information")
 	mode := flag.String("mode", "", "Run mode: server or client")
-	validate := flag.Bool("validate", false, "Validate configuration and exit")
+	validateOnly := flag.Bool("validate", false, "Validate configuration and exit")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("HesarTunnel v%s\n", Version)
-		fmt.Printf("  Build Date: %s\n", BuildDate)
-		fmt.Printf("  Git Commit: %s\n", GitCommit)
-		fmt.Printf("  Go Version: %s\n", runtime.Version())
-		fmt.Printf("  OS/Arch:    %s/%s\n", runtime.GOOS, runtime.GOARCH)
+		fmt.Printf("  Build:    %s\n", BuildDate)
+		fmt.Printf("  Commit:   %s\n", GitCommit)
+		fmt.Printf("  Go:       %s\n", runtime.Version())
+		fmt.Printf("  OS/Arch:  %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		os.Exit(0)
 	}
 
-	// Setup logging
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
 	log.SetPrefix("[HesarTunnel] ")
 
-	// Load config
 	cfg, err := pkg.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("[FATAL] Configuration error: %v", err)
 	}
 
-	if *validate {
+	if *validateOnly {
 		fmt.Println("Configuration is valid.")
-		fmt.Printf("  Protocol:    %s\n", cfg.Tunnel.Protocol)
-		fmt.Printf("  Tunnel Port: %d\n", cfg.Tunnel.TunnelPort)
-		fmt.Printf("  Remote IP:   %s\n", cfg.Tunnel.RemoteIP)
-		fmt.Printf("  Config Ports: %s\n", cfg.Tunnel.ConfigPorts)
-		fmt.Printf("  Encryption:  %s\n", cfg.Crypto.Method)
-		fmt.Printf("  Obfuscation: %s (enabled: %v)\n", cfg.Crypto.ObfsMode, cfg.Crypto.Obfuscation)
 		ports, _ := pkg.ParsePorts(cfg.Tunnel.ConfigPorts)
-		fmt.Printf("  Parsed Ports: %v\n", ports)
+		fmt.Printf("  Protocol:       %s\n", cfg.Tunnel.Protocol)
+		fmt.Printf("  Tunnel Port:    %d\n", cfg.Tunnel.TunnelPort)
+		fmt.Printf("  Remote IP:      %s\n", cfg.Tunnel.RemoteIP)
+		fmt.Printf("  Config Ports:   %v\n", ports)
+		fmt.Printf("  Server Bind:    %s\n", cfg.Tunnel.ServerBind)
+		fmt.Printf("  Client Forward: %s\n", cfg.Tunnel.ClientForward)
+		fmt.Printf("  Encryption:     %s\n", cfg.Crypto.Method)
+		fmt.Printf("  Obfuscation:    %s (enabled: %v)\n", cfg.Crypto.ObfsMode, cfg.Crypto.Obfuscation)
 		os.Exit(0)
 	}
 
-	if *mode == "" {
+	if *mode != "server" && *mode != "client" {
 		fmt.Fprintln(os.Stderr, "Error: --mode is required (server or client)")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Usage:")
@@ -69,77 +67,58 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *mode != "server" && *mode != "client" {
-		log.Fatalf("[FATAL] Invalid mode: %s (use 'server' or 'client')", *mode)
-	}
-
-	// Set GOMAXPROCS
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	log.Printf("[INFO] HesarTunnel v%s starting in %s mode", Version, *mode)
-	log.Printf("[INFO] Go routines: GOMAXPROCS=%d, NumCPU=%d", runtime.GOMAXPROCS(0), runtime.NumCPU())
 
-	// Context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Signal handling
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Error channel
 	errChan := make(chan error, 1)
 
 	switch *mode {
 	case "server":
 		srv, err := pkg.NewServer(cfg)
 		if err != nil {
-			log.Fatalf("[FATAL] Failed to create server: %v", err)
+			log.Fatalf("[FATAL] Server init: %v", err)
 		}
-
-		go func() {
-			errChan <- srv.Run(ctx)
-		}()
+		go func() { errChan <- srv.Run(ctx) }()
 
 		select {
 		case sig := <-sigChan:
-			log.Printf("[INFO] Received signal: %v, shutting down...", sig)
+			log.Printf("[INFO] Signal %v received", sig)
 			cancel()
-			// Give goroutines time to cleanup
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer shutdownCancel()
-			srv.Shutdown(shutdownCtx)
-
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer shutCancel()
+			srv.Shutdown(shutCtx)
 		case err := <-errChan:
 			if err != nil {
-				log.Fatalf("[FATAL] Server error: %v", err)
+				log.Fatalf("[FATAL] Server: %v", err)
 			}
 		}
 
 	case "client":
 		cli, err := pkg.NewClient(cfg)
 		if err != nil {
-			log.Fatalf("[FATAL] Failed to create client: %v", err)
+			log.Fatalf("[FATAL] Client init: %v", err)
 		}
-
-		go func() {
-			errChan <- cli.Run(ctx)
-		}()
+		go func() { errChan <- cli.Run(ctx) }()
 
 		select {
 		case sig := <-sigChan:
-			log.Printf("[INFO] Received signal: %v, shutting down...", sig)
+			log.Printf("[INFO] Signal %v received", sig)
 			cancel()
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer shutdownCancel()
-			cli.Shutdown(shutdownCtx)
-
+			shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer shutCancel()
+			cli.Shutdown(shutCtx)
 		case err := <-errChan:
 			if err != nil {
-				log.Fatalf("[FATAL] Client error: %v", err)
+				log.Fatalf("[FATAL] Client: %v", err)
 			}
 		}
 	}
 
-	log.Println("[INFO] HesarTunnel stopped gracefully")
+	log.Println("[INFO] HesarTunnel stopped")
 }
