@@ -2,8 +2,6 @@
 # ═══════════════════════════════════════════════════════════
 # HesarTunnel Manager v1.2.0
 # https://github.com/Meytiz/HesarTunnel
-#
-# Interactive management script
 # ═══════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -61,10 +59,8 @@ detect_arch() {
     esac
 }
 
-# ─── اصلاح اصلی: خواندن os-release بدون تداخل ───────────
 detect_os() {
     if [[ -f /etc/os-release ]]; then
-        # از subshell و grep استفاده می‌کنیم تا readonly تداخل نکند
         OS=$(grep -oP '^ID=\K.*' /etc/os-release | tr -d '"' | head -1)
     elif [[ -f /etc/centos-release ]]; then
         OS="centos"
@@ -111,8 +107,19 @@ is_running() {
     systemctl is-active --quiet "${SERVICE_NAME}" 2>/dev/null
 }
 
-is_enabled() {
-    systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null
+# ─── Config Reader Helpers ────────────────────────────────
+
+get_config_value() {
+    local key="$1"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        grep "^${key}" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*= *//;s/"//g;s/ *$//'
+    fi
+}
+
+get_service_mode() {
+    if [[ -f "$SERVICE_FILE" ]]; then
+        grep -oP '(?<=--mode )\w+' "$SERVICE_FILE" 2>/dev/null | head -1
+    fi
 }
 
 # ─── Banner ───────────────────────────────────────────────
@@ -137,7 +144,6 @@ BANNER
     echo -e "    ${CYAN}github.com/${GITHUB_USER}/${GITHUB_REPO}${NC}"
     echo ""
 
-    # Quick status
     if is_running; then
         local pid
         pid=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || echo "?")
@@ -170,12 +176,8 @@ optimize_server() {
     step "Applying kernel optimizations..."
 
     cat > /etc/sysctl.d/99-hesar-tunnel.conf << 'EOF'
-# HesarTunnel Server Optimization
-# BBR
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-
-# TCP Buffers
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.core.rmem_default = 1048576
@@ -183,8 +185,6 @@ net.core.wmem_default = 1048576
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.core.netdev_max_backlog = 250000
-
-# TCP Tuning
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
@@ -198,23 +198,16 @@ net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_no_metrics_save = 1
-
-# File limits
 fs.file-max = 1048576
 fs.nr_open = 1048576
-
-# Network
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.ip_forward = 1
 net.core.optmem_max = 65535
 EOF
 
     sysctl -p /etc/sysctl.d/99-hesar-tunnel.conf &>/dev/null || true
-
-    # conntrack - optional, may not be loaded
     sysctl -w net.netfilter.nf_conntrack_max=2097152 &>/dev/null || true
 
-    # Increase ulimits
     cat > /etc/security/limits.d/99-hesar-tunnel.conf << 'EOF'
 *       soft    nofile  1048576
 *       hard    nofile  1048576
@@ -261,7 +254,6 @@ download_binary() {
 build_from_source() {
     step "Building from source..."
 
-    # Install Go if missing
     if ! command -v go &>/dev/null; then
         step "Installing Go 1.22..."
         local go_ver="1.22.5"
@@ -370,18 +362,19 @@ EOF
     info "Configuration saved to ${CONFIG_FILE}"
 }
 
-# ─── Read User Input Helpers ──────────────────────────────
+# ─── Input Helpers (>&2 for prompts) ──────────────────────
 
 read_required() {
     local prompt="$1"
     local var
     while true; do
-        read -rp "$(echo -e "${CYAN}  ${prompt}: ${NC}")" var
+        echo -ne "${CYAN}  ${prompt}: ${NC}" >&2
+        read -r var
         if [[ -n "$var" ]]; then
             echo "$var"
             return
         fi
-        error "This field is required"
+        echo -e "${RED}[✗] This field is required${NC}" >&2
     done
 }
 
@@ -389,7 +382,8 @@ read_default() {
     local prompt="$1"
     local default="$2"
     local var
-    read -rp "$(echo -e "${CYAN}  ${prompt} [${default}]: ${NC}")" var
+    echo -ne "${CYAN}  ${prompt} [${default}]: ${NC}" >&2
+    read -r var
     echo "${var:-$default}"
 }
 
@@ -398,27 +392,76 @@ read_port() {
     local default="$2"
     local var
     while true; do
-        read -rp "$(echo -e "${CYAN}  ${prompt} [${default}]: ${NC}")" var
+        echo -ne "${CYAN}  ${prompt} [${default}]: ${NC}" >&2
+        read -r var
         var="${var:-$default}"
         if [[ "$var" =~ ^[0-9]+$ ]] && (( var >= 1 && var <= 65535 )); then
             echo "$var"
             return
         fi
-        error "Invalid port number (1-65535)"
+        echo -e "${RED}[✗] Invalid port number (1-65535)${NC}" >&2
     done
 }
 
 read_protocol() {
-    echo ""
-    echo -e "  ${YELLOW}Transport Protocol:${NC}"
-    echo -e "    1) ${WHITE}TCP${NC}  — Stable connections, lower overhead"
-    echo -e "    2) ${WHITE}KCP${NC}  — Better for lossy/unstable networks"
-    echo ""
+    echo "" >&2
+    echo -e "  ${YELLOW}Transport Protocol:${NC}" >&2
+    echo -e "    1) ${WHITE}TCP${NC}  — Stable connections, lower overhead" >&2
+    echo -e "    2) ${WHITE}KCP${NC}  — Better for lossy/unstable networks" >&2
+    echo "" >&2
     local choice
-    read -rp "$(echo -e "${CYAN}  Choose [1]: ${NC}")" choice
+    echo -ne "${CYAN}  Choose [1]: ${NC}" >&2
+    read -r choice
     case "${choice:-1}" in
         2) echo "kcp" ;;
         *) echo "tcp" ;;
+    esac
+}
+
+read_encryption() {
+    echo "" >&2
+    echo -e "  ${YELLOW}Encryption Method:${NC}" >&2
+    echo -e "    1) ${WHITE}chacha20-poly1305${NC}  — Recommended (faster without AES-NI)" >&2
+    echo -e "    2) ${WHITE}aes-256-gcm${NC}        — Faster with AES-NI CPUs" >&2
+    echo "" >&2
+    local choice
+    echo -ne "${CYAN}  Choose [1]: ${NC}" >&2
+    read -r choice
+    case "${choice:-1}" in
+        2) echo "aes-256-gcm" ;;
+        *) echo "chacha20-poly1305" ;;
+    esac
+}
+
+read_obfs_mode() {
+    echo "" >&2
+    echo -e "  ${YELLOW}Obfuscation Mode:${NC}" >&2
+    echo -e "    1) ${WHITE}tls-hello${NC}        — TLS 1.3 records (recommended)" >&2
+    echo -e "    2) ${WHITE}http${NC}             — HTTP response wrapper" >&2
+    echo -e "    3) ${WHITE}random-padding${NC}   — Random padding" >&2
+    echo -e "    4) ${WHITE}disabled${NC}         — No obfuscation" >&2
+    echo "" >&2
+    local choice
+    echo -ne "${CYAN}  Choose [1]: ${NC}" >&2
+    read -r choice
+    case "${choice:-1}" in
+        2) echo "http" ;;
+        3) echo "random-padding" ;;
+        4) echo "disabled" ;;
+        *) echo "tls-hello" ;;
+    esac
+}
+
+read_yes_no() {
+    local prompt="$1"
+    local default="$2"
+    local var
+    echo -ne "${CYAN}  ${prompt} [${default}]: ${NC}" >&2
+    read -r var
+    var="${var:-$default}"
+    case "$var" in
+        y|Y|yes|YES) echo "true" ;;
+        *) echo "false" ;;
     esac
 }
 
@@ -434,7 +477,6 @@ setup_iran() {
     separator
     echo ""
 
-    # Install binary
     if is_installed; then
         warn "Binary already installed"
         read -rp "$(echo -e "${CYAN}  Reinstall binary? [y/N]: ${NC}")" reinstall
@@ -489,7 +531,18 @@ setup_iran() {
     echo -e "  ${YELLOW}${BOLD}⚠  Save the secret key! Use the same key on the foreign server.${NC}"
     echo ""
 
-    systemctl status "${SERVICE_NAME}" --no-pager -l 2>/dev/null | head -8 || true
+    sleep 2
+    if is_running; then
+        info "Service is running"
+    else
+        warn "Service failed to start. Check logs:"
+        echo ""
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -5 "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
+                echo -e "    ${RED}${line}${NC}"
+            done
+        fi
+    fi
 
     echo ""
     read -rp "$(echo -e "${CYAN}  Press Enter to continue...${NC}")"
@@ -550,7 +603,17 @@ setup_foreign() {
     echo -e "    Obfs:       ${CYAN}TLS 1.3 Records${NC}"
     echo ""
 
-    systemctl status "${SERVICE_NAME}" --no-pager -l 2>/dev/null | head -8 || true
+    sleep 2
+    if is_running; then
+        info "Service is running"
+    else
+        warn "Service failed to start. Check logs:"
+        if [[ -f "$LOG_FILE" ]]; then
+            tail -5 "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
+                echo -e "    ${RED}${line}${NC}"
+            done
+        fi
+    fi
 
     echo ""
     read -rp "$(echo -e "${CYAN}  Press Enter to continue...${NC}")"
@@ -564,7 +627,6 @@ show_status() {
     separator
     echo ""
 
-    # Service
     echo -e "  ${WHITE}${BOLD}Service:${NC}"
     if is_running; then
         local pid mem cpu conns
@@ -586,23 +648,25 @@ show_status() {
 
     echo ""
 
-    # Config
     if [[ -f "$CONFIG_FILE" ]]; then
         echo -e "  ${WHITE}${BOLD}Configuration:${NC}"
-        local val
+        local mode
+        mode=$(get_service_mode)
+        printf "    %-14s ${CYAN}%s${NC}\n" "mode:" "${mode:-N/A}"
         for key in protocol tunnel_port remote_ip config_ports; do
-            val=$(grep "^${key}" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*= *//;s/"//g;s/ *$//' || echo "N/A")
-            printf "    %-14s ${CYAN}%s${NC}\n" "${key}:" "$val"
+            local val
+            val=$(get_config_value "$key")
+            printf "    %-14s ${CYAN}%s${NC}\n" "${key}:" "${val:-N/A}"
         done
-        val=$(grep "^method" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*= *//;s/"//g' || echo "N/A")
-        printf "    %-14s ${CYAN}%s${NC}\n" "encryption:" "$val"
-        val=$(grep "^obfs_mode" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*= *//;s/"//g' || echo "N/A")
-        printf "    %-14s ${CYAN}%s${NC}\n" "obfuscation:" "$val"
+        local val
+        val=$(get_config_value "method")
+        printf "    %-14s ${CYAN}%s${NC}\n" "encryption:" "${val:-N/A}"
+        val=$(get_config_value "obfs_mode")
+        printf "    %-14s ${CYAN}%s${NC}\n" "obfuscation:" "${val:-N/A}"
     fi
 
     echo ""
 
-    # Recent logs
     echo -e "  ${WHITE}${BOLD}Recent Logs (last 15 lines):${NC}"
     if [[ -f "$LOG_FILE" ]]; then
         tail -15 "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
@@ -616,17 +680,312 @@ show_status() {
     read -rp "$(echo -e "${CYAN}  Press Enter to continue...${NC}")"
 }
 
-# ─── Service Management ──────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+# ─── Edit Configuration ──────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+
+edit_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "No configuration found at ${CONFIG_FILE}"
+        echo -e "  ${YELLOW}Please run Setup first (option 2 or 3)${NC}"
+        echo ""
+        read -rp "$(echo -e "${CYAN}  Press Enter to continue...${NC}")"
+        return
+    fi
+
+    # Read current values
+    local cur_protocol cur_tunnel_port cur_remote_ip cur_config_ports cur_secret_key
+    local cur_method cur_obfuscation cur_obfs_mode
+    local cur_tunnel_count cur_buffer_size cur_timeout cur_keepalive cur_no_delay cur_max_idle
+
+    cur_protocol=$(get_config_value "protocol")
+    cur_tunnel_port=$(get_config_value "tunnel_port")
+    cur_remote_ip=$(get_config_value "remote_ip")
+    cur_config_ports=$(get_config_value "config_ports")
+    cur_secret_key=$(get_config_value "secret_key")
+    cur_method=$(get_config_value "method")
+    cur_obfuscation=$(get_config_value "obfuscation")
+    cur_obfs_mode=$(get_config_value "obfs_mode")
+    cur_tunnel_count=$(get_config_value "tunnel_count")
+    cur_buffer_size=$(get_config_value "buffer_size")
+    cur_timeout=$(get_config_value "timeout")
+    cur_keepalive=$(get_config_value "keepalive")
+    cur_no_delay=$(get_config_value "no_delay")
+    cur_max_idle=$(get_config_value "max_idle")
+
+    # Set defaults for missing values
+    cur_tunnel_count="${cur_tunnel_count:-4}"
+    cur_buffer_size="${cur_buffer_size:-32768}"
+    cur_timeout="${cur_timeout:-30}"
+    cur_keepalive="${cur_keepalive:-10}"
+    cur_no_delay="${cur_no_delay:-true}"
+    cur_max_idle="${cur_max_idle:-300}"
+    cur_obfuscation="${cur_obfuscation:-true}"
+
+    while true; do
+        separator
+        echo -e "  ${PURPLE}${BOLD}Edit Configuration${NC}"
+        separator
+        echo ""
+        echo -e "  ${WHITE}${BOLD}Current Settings:${NC}"
+        echo ""
+        echo -e "  ${WHITE}── Tunnel ──────────────────────────────────${NC}"
+        echo -e "    1) Protocol:       ${CYAN}${cur_protocol}${NC}"
+        echo -e "    2) Tunnel Port:    ${CYAN}${cur_tunnel_port}${NC}"
+        echo -e "    3) Remote IP:      ${CYAN}${cur_remote_ip}${NC}"
+        echo -e "    4) Config Ports:   ${CYAN}${cur_config_ports}${NC}"
+        echo -e "    5) Secret Key:     ${CYAN}${cur_secret_key:0:8}...${NC}"
+        echo ""
+        echo -e "  ${WHITE}── Encryption ──────────────────────────────${NC}"
+        echo -e "    6) Method:         ${CYAN}${cur_method}${NC}"
+        echo -e "    7) Obfuscation:    ${CYAN}${cur_obfuscation}${NC}"
+        echo -e "    8) Obfs Mode:      ${CYAN}${cur_obfs_mode}${NC}"
+        echo ""
+        echo -e "  ${WHITE}── Performance ─────────────────────────────${NC}"
+        echo -e "    9) Tunnel Count:   ${CYAN}${cur_tunnel_count}${NC}"
+        echo -e "   10) Buffer Size:    ${CYAN}${cur_buffer_size}${NC}"
+        echo -e "   11) Timeout:        ${CYAN}${cur_timeout}s${NC}"
+        echo -e "   12) Keepalive:      ${CYAN}${cur_keepalive}s${NC}"
+        echo -e "   13) TCP NoDelay:    ${CYAN}${cur_no_delay}${NC}"
+        echo -e "   14) Max Idle:       ${CYAN}${cur_max_idle}s${NC}"
+        echo ""
+        echo -e "  ${WHITE}── Actions ─────────────────────────────────${NC}"
+        echo -e "   ${GREEN}s)${NC}  Save & Apply changes"
+        echo -e "   ${RED}d)${NC}  Discard changes"
+        echo -e "   ${WHITE}0)${NC}  Back (without saving)"
+        echo ""
+
+        read -rp "$(echo -e "${CYAN}  Edit option: ${NC}")" edit_choice
+
+        case "$edit_choice" in
+            1)
+                local new_val
+                new_val=$(read_protocol)
+                cur_protocol="$new_val"
+                info "Protocol changed to: ${cur_protocol}"
+                ;;
+            2)
+                local new_val
+                new_val=$(read_port "New tunnel port" "$cur_tunnel_port")
+                cur_tunnel_port="$new_val"
+                info "Tunnel port changed to: ${cur_tunnel_port}"
+                ;;
+            3)
+                local new_val
+                new_val=$(read_default "New remote IP" "$cur_remote_ip")
+                cur_remote_ip="$new_val"
+                info "Remote IP changed to: ${cur_remote_ip}"
+                ;;
+            4)
+                echo -e "  ${YELLOW}Port format: single=80 | multi=80,443 | range=80-100${NC}"
+                local new_val
+                new_val=$(read_default "New config ports" "$cur_config_ports")
+                cur_config_ports="$new_val"
+                info "Config ports changed to: ${cur_config_ports}"
+                ;;
+            5)
+                echo -e "  ${YELLOW}Current key: ${cur_secret_key}${NC}"
+                local new_val
+                new_val=$(read_default "New secret key" "$cur_secret_key")
+                cur_secret_key="$new_val"
+                info "Secret key updated"
+                ;;
+            6)
+                local new_val
+                new_val=$(read_encryption)
+                cur_method="$new_val"
+                info "Encryption changed to: ${cur_method}"
+                ;;
+            7)
+                if [[ "$cur_obfuscation" == "true" ]]; then
+                    cur_obfuscation="false"
+                    info "Obfuscation DISABLED"
+                else
+                    cur_obfuscation="true"
+                    info "Obfuscation ENABLED"
+                fi
+                ;;
+            8)
+                local new_val
+                new_val=$(read_obfs_mode)
+                if [[ "$new_val" == "disabled" ]]; then
+                    cur_obfuscation="false"
+                    cur_obfs_mode="tls-hello"
+                    info "Obfuscation disabled"
+                else
+                    cur_obfuscation="true"
+                    cur_obfs_mode="$new_val"
+                    info "Obfs mode changed to: ${cur_obfs_mode}"
+                fi
+                ;;
+            9)
+                local new_val
+                new_val=$(read_default "Tunnel count (1-32)" "$cur_tunnel_count")
+                if [[ "$new_val" =~ ^[0-9]+$ ]] && (( new_val >= 1 && new_val <= 32 )); then
+                    cur_tunnel_count="$new_val"
+                    info "Tunnel count changed to: ${cur_tunnel_count}"
+                else
+                    error "Invalid value (1-32)"
+                fi
+                ;;
+            10)
+                local new_val
+                new_val=$(read_default "Buffer size in bytes" "$cur_buffer_size")
+                if [[ "$new_val" =~ ^[0-9]+$ ]] && (( new_val >= 4096 && new_val <= 1048576 )); then
+                    cur_buffer_size="$new_val"
+                    info "Buffer size changed to: ${cur_buffer_size}"
+                else
+                    error "Invalid value (4096-1048576)"
+                fi
+                ;;
+            11)
+                local new_val
+                new_val=$(read_default "Timeout in seconds" "$cur_timeout")
+                if [[ "$new_val" =~ ^[0-9]+$ ]] && (( new_val >= 5 && new_val <= 300 )); then
+                    cur_timeout="$new_val"
+                    info "Timeout changed to: ${cur_timeout}s"
+                else
+                    error "Invalid value (5-300)"
+                fi
+                ;;
+            12)
+                local new_val
+                new_val=$(read_default "Keepalive in seconds" "$cur_keepalive")
+                if [[ "$new_val" =~ ^[0-9]+$ ]] && (( new_val >= 3 && new_val <= 120 )); then
+                    cur_keepalive="$new_val"
+                    info "Keepalive changed to: ${cur_keepalive}s"
+                else
+                    error "Invalid value (3-120)"
+                fi
+                ;;
+            13)
+                if [[ "$cur_no_delay" == "true" ]]; then
+                    cur_no_delay="false"
+                    info "TCP NoDelay DISABLED"
+                else
+                    cur_no_delay="true"
+                    info "TCP NoDelay ENABLED"
+                fi
+                ;;
+            14)
+                local new_val
+                new_val=$(read_default "Max idle in seconds" "$cur_max_idle")
+                if [[ "$new_val" =~ ^[0-9]+$ ]] && (( new_val >= 30 && new_val <= 3600 )); then
+                    cur_max_idle="$new_val"
+                    info "Max idle changed to: ${cur_max_idle}s"
+                else
+                    error "Invalid value (30-3600)"
+                fi
+                ;;
+
+            s|S)
+                # ─── Save configuration ───
+                echo ""
+                step "Saving configuration..."
+
+                mkdir -p "$CONFIG_DIR"
+                cat > "$CONFIG_FILE" << EOF
+[tunnel]
+protocol = "${cur_protocol}"
+tunnel_port = ${cur_tunnel_port}
+remote_ip = "${cur_remote_ip}"
+config_ports = "${cur_config_ports}"
+secret_key = "${cur_secret_key}"
+
+[crypto]
+method = "${cur_method}"
+obfuscation = ${cur_obfuscation}
+obfs_mode = "${cur_obfs_mode}"
+
+[kcp]
+preset = "fast2"
+data_shard = 10
+parity_shard = 3
+snd_wnd = 1024
+rcv_wnd = 1024
+mtu = 1350
+dscp = 46
+
+[performance]
+tunnel_count = ${cur_tunnel_count}
+buffer_size = ${cur_buffer_size}
+timeout = ${cur_timeout}
+keepalive = ${cur_keepalive}
+no_delay = ${cur_no_delay}
+max_idle = ${cur_max_idle}
+EOF
+
+                chmod 600 "$CONFIG_FILE"
+                info "Configuration saved"
+
+                # Ask to restart
+                echo ""
+                read -rp "$(echo -e "${CYAN}  Restart service to apply changes? [Y/n]: ${NC}")" do_restart
+                if [[ ! "$do_restart" =~ ^[nN]$ ]]; then
+                    systemctl restart "${SERVICE_NAME}" 2>/dev/null
+                    sleep 2
+                    if is_running; then
+                        info "Service restarted successfully"
+                    else
+                        warn "Service failed to start. Check logs with option 4 in Manage menu"
+                    fi
+                else
+                    warn "Changes saved but service NOT restarted"
+                    warn "Restart manually to apply changes"
+                fi
+
+                echo ""
+                read -rp "$(echo -e "${CYAN}  Press Enter to continue...${NC}")"
+                return
+                ;;
+
+            d|D)
+                warn "Changes discarded"
+                echo ""
+                read -rp "$(echo -e "${CYAN}  Press Enter to continue...${NC}")"
+                return
+                ;;
+
+            0|"")
+                return
+                ;;
+
+            *)
+                error "Invalid option"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ═══════════════════════════════════════════════════════════
+# ─── Service Management (با Edit Config) ──────────────────
+# ═══════════════════════════════════════════════════════════
 
 manage_service() {
     separator
     echo -e "  ${PURPLE}${BOLD}Service Management${NC}"
     separator
     echo ""
-    echo -e "    1) ${GREEN}Start${NC}"
-    echo -e "    2) ${YELLOW}Stop${NC}"
-    echo -e "    3) ${BLUE}Restart${NC}"
-    echo -e "    4) ${CYAN}View Live Logs${NC}"
+
+    # Show current status
+    if is_running; then
+        local pid
+        pid=$(systemctl show -p MainPID --value "${SERVICE_NAME}" 2>/dev/null || echo "?")
+        echo -e "  Current: ${GREEN}● Running${NC} (PID: ${pid})"
+    elif is_installed; then
+        echo -e "  Current: ${YELLOW}○ Stopped${NC}"
+    else
+        echo -e "  Current: ${RED}✗ Not Installed${NC}"
+    fi
+    echo ""
+
+    echo -e "    1) ${GREEN}Start${NC}          Start tunnel service"
+    echo -e "    2) ${YELLOW}Stop${NC}           Stop tunnel service"
+    echo -e "    3) ${BLUE}Restart${NC}        Restart tunnel service"
+    echo -e "    4) ${CYAN}View Logs${NC}      Live log viewer"
+    echo -e "    5) ${PURPLE}Edit Config${NC}    Modify tunnel configuration"
+    echo -e "    6) ${WHITE}View Config${NC}    Show current config file"
     echo -e "    0) ${WHITE}Back${NC}"
     echo ""
 
@@ -634,24 +993,83 @@ manage_service() {
 
     case "$choice" in
         1)
-            systemctl start "${SERVICE_NAME}" 2>/dev/null && info "Service started" || error "Start failed"
+            if ! is_installed; then
+                error "HesarTunnel is not installed. Run Setup first."
+            elif is_running; then
+                warn "Service is already running"
+            else
+                systemctl start "${SERVICE_NAME}" 2>/dev/null && info "Service started" || error "Start failed"
+            fi
             ;;
         2)
-            systemctl stop "${SERVICE_NAME}" 2>/dev/null && info "Service stopped" || error "Stop failed"
+            if is_running; then
+                systemctl stop "${SERVICE_NAME}" 2>/dev/null && info "Service stopped" || error "Stop failed"
+            else
+                warn "Service is not running"
+            fi
             ;;
         3)
-            systemctl restart "${SERVICE_NAME}" 2>/dev/null && info "Service restarted" || error "Restart failed"
+            systemctl restart "${SERVICE_NAME}" 2>/dev/null
+            sleep 2
+            if is_running; then
+                info "Service restarted successfully"
+            else
+                error "Restart failed. Check logs (option 4)"
+            fi
             ;;
         4)
+            echo ""
             echo -e "  ${YELLOW}Press Ctrl+C to exit log viewer${NC}"
             echo ""
             if [[ -f "$LOG_FILE" ]]; then
+                # Show last 20 lines first, then follow
+                echo -e "  ${WHITE}── Last 20 lines ──${NC}"
+                tail -20 "$LOG_FILE" 2>/dev/null | while IFS= read -r line; do
+                    echo -e "  ${CYAN}${line}${NC}"
+                done
+                echo -e "  ${WHITE}── Live feed ──${NC}"
                 tail -f "$LOG_FILE" 2>/dev/null || true
             else
                 journalctl -u "${SERVICE_NAME}" -f --no-pager 2>/dev/null || true
             fi
             ;;
+        5)
+            edit_config
+            return
+            ;;
+        6)
+            echo ""
+            if [[ -f "$CONFIG_FILE" ]]; then
+                echo -e "  ${WHITE}${BOLD}File: ${CONFIG_FILE}${NC}"
+                separator
+                while IFS= read -r line; do
+                    if [[ "$line" =~ ^# ]] || [[ "$line" =~ ^\[  ]]; then
+                        echo -e "  ${YELLOW}${line}${NC}"
+                    elif [[ "$line" =~ = ]]; then
+                        local key val
+                        key=$(echo "$line" | cut -d'=' -f1 | tr -d ' ')
+                        val=$(echo "$line" | cut -d'=' -f2-)
+                        # Hide full secret key
+                        if [[ "$key" == "secret_key" ]]; then
+                            local raw_val
+                            raw_val=$(echo "$val" | tr -d ' "')
+                            echo -e "  ${WHITE}${key}${NC} = ${CYAN}${raw_val:0:8}...${NC}"
+                        else
+                            echo -e "  ${WHITE}${key}${NC} =${CYAN}${val}${NC}"
+                        fi
+                    else
+                        echo -e "  ${line}"
+                    fi
+                done < "$CONFIG_FILE"
+                separator
+            else
+                error "No configuration file found"
+            fi
+            ;;
         0|"") return ;;
+        *)
+            error "Invalid option"
+            ;;
     esac
 
     echo ""
@@ -735,7 +1153,7 @@ main_menu() {
         echo -e "    ${WHITE}2)${NC} ${CYAN}Setup Iran Server${NC}      Client (connects to foreign)"
         echo -e "    ${WHITE}3)${NC} ${CYAN}Setup Foreign Server${NC}   Server (accepts connections)"
         echo -e "    ${WHITE}4)${NC} ${BLUE}Tunnel Status${NC}          View status & connections"
-        echo -e "    ${WHITE}5)${NC} ${PURPLE}Manage Service${NC}         Start / Stop / Restart / Logs"
+        echo -e "    ${WHITE}5)${NC} ${PURPLE}Manage Service${NC}         Start / Stop / Restart / Edit / Logs"
         echo -e "    ${WHITE}6)${NC} ${RED}Uninstall${NC}              Remove tunnel / binary / all"
         echo -e "    ${WHITE}0)${NC} ${WHITE}Exit${NC}"
         echo ""
