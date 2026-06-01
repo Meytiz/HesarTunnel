@@ -1,77 +1,154 @@
-## 🚀 Installation
+# HESAR
+
+> Lightweight remote connectivity and management platform built with Go.
+
+HESAR is a Go-based project that combines a backend service and a web management panel for handling remote connectivity and service orchestration through a simple interface.
+
+---
+
+## Features
+
+- Go backend
+- Web-based management panel
+- Release build system
+- Linux build support
+- Frontend asset bundling
+- Automated installation script
+- Modular project structure
+- GitHub-friendly deployment workflow
+
+---
+
+## Project Structure
+
+```text
+cmd/
+configs/
+internal/
+pkg/
+public/
+scripts/
+release/
+```
+
+---
+
+## Requirements
+
+### Backend
+
+- Go 1.24+
+
+### Frontend
+
+- Node.js
+- npm
+
+---
+
+## Installation
 
 ### Automatic Installation
-
-Install HESAR using the official installation script:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/install.sh)
 ```
 
-The installer will guide you through:
+The installer automatically:
 
-- Panel configuration
-- Administrator account creation
-- Service setup
-- Automatic startup configuration
-
-After installation, the script will display:
-
-```text
-Panel URL
-Panel Port
-Username
-Password
-```
+- Downloads required files
+- Configures the environment
+- Installs HESAR
+- Starts required services
 
 ---
 
-### Offline Installation
+### Manual Installation
 
-For environments without direct GitHub access:
+Clone repository:
 
 ```bash
 git clone https://github.com/Meytiz/HesarTunnel.git
 cd HesarTunnel
 ```
 
-Build the frontend:
+Install dependencies:
 
 ```bash
+go mod download
 npm install
+```
+
+Build frontend:
+
+```bash
 npm run build
 ```
 
-Build the backend:
+Build backend:
 
 ```bash
-go build -o hesar .
+go build ./...
 ```
 
 Run:
 
 ```bash
-./hesar
+go run .
 ```
 
 ---
 
-### Update
+## Release Build
 
-Update to the latest version:
+Linux AMD64:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Meytiz/HesarTunnel/main/install.sh)
+GOOS=linux GOARCH=amd64 HESAR_VERSION=1.4.2 bash ./scripts/build-release.sh
+```
+
+PowerShell:
+
+```powershell
+$env:GOOS="linux"
+$env:GOARCH="amd64"
+$env:HESAR_VERSION="1.4.2"
+
+bash .\scripts\build-release.sh
 ```
 
 ---
 
-### Uninstall
+## Development
 
-Remove HESAR completely:
+Run frontend:
 
 ```bash
-hesar uninstall
+npm run dev
 ```
 
-Or remove only specific components from the management panel.
+Run backend:
+
+```bash
+go run .
+```
+
+---
+
+## Status
+
+🚧 Active Development
+
+This project is currently under active development.
+
+---
+
+## License
+
+MIT License
+
+---
+
+## Author
+
+GitHub: https://github.com/Meytiz
